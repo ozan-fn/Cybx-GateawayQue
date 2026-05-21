@@ -284,6 +284,9 @@ export const useConnectionsStore = create<ConnectionsState>()((set, get) => ({
             : c,
         ),
       }));
+      if (result.valid) {
+        await get().fetch();
+      }
     } catch (err) {
       set({
         error:

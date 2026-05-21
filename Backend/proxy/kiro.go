@@ -23,9 +23,17 @@ type kiroEndpoint struct {
 	Origin    string
 	AmzTarget string
 	Name      string
+	Runtime   bool
 }
 
 var kiroEndpoints = []kiroEndpoint{
+	{
+		URL:       "https://runtime.{region}.kiro.dev/generateAssistantResponse",
+		Origin:    "AI_EDITOR",
+		AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+		Name:      "Kiro Runtime",
+		Runtime:   true,
+	},
 	{
 		URL:       "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
 		Origin:    "AI_EDITOR",
@@ -119,6 +127,17 @@ func isKiroQuotaError(err error) bool {
 	return containsKiroQuotaSignal(err.Error())
 }
 
+func isKiroTemporaryLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *kiroHTTPError
+	if errors.As(err, &httpErr) {
+		return containsKiroTemporaryLimitSignal(httpErr.Body)
+	}
+	return containsKiroTemporaryLimitSignal(err.Error())
+}
+
 func containsKiroQuotaSignal(text string) bool {
 	lower := strings.ToLower(text)
 	return strings.Contains(lower, "quota") ||
@@ -126,6 +145,21 @@ func containsKiroQuotaSignal(text string) bool {
 		strings.Contains(lower, "usage limit") ||
 		strings.Contains(lower, "limit_exceeded") ||
 		strings.Contains(lower, "subscription limit")
+}
+
+func containsKiroTemporaryLimitSignal(text string) bool {
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "suspicious activity") ||
+		strings.Contains(lower, "temporary limits") ||
+		strings.Contains(lower, "temporarily limited")
+}
+
+func kiroRetryAfter(err error) time.Duration {
+	var httpErr *kiroHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.RetryAfter
+	}
+	return 0
 }
 
 func kiroErrorStatus(err error, fallback int) int {
@@ -151,6 +185,45 @@ func kiroClaudeErrorType(err error) string {
 		return "rate_limit_error"
 	}
 	return "api_error"
+}
+
+func kiroAccountCooldown(err error) time.Duration {
+	if retryAfter := kiroRetryAfter(err); retryAfter > 0 {
+		return retryAfter
+	}
+	if isKiroTemporaryLimitError(err) {
+		return 10 * time.Minute
+	}
+	if isKiroRateLimitError(err) {
+		return time.Minute
+	}
+	if isKiroQuotaError(err) {
+		return time.Hour
+	}
+	return 0
+}
+
+func isKiroAccountFailoverError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *kiroHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == http.StatusTooManyRequests ||
+			httpErr.StatusCode == http.StatusUnauthorized ||
+			httpErr.StatusCode == http.StatusForbidden ||
+			httpErr.StatusCode >= http.StatusInternalServerError
+	}
+	if isKiroRateLimitError(err) || isKiroTemporaryLimitError(err) || isKiroQuotaError(err) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "unauthorized") ||
+		strings.Contains(lower, "forbidden") ||
+		strings.Contains(lower, "status 401") ||
+		strings.Contains(lower, "status 403") ||
+		strings.Contains(lower, "status 5") ||
+		strings.Contains(lower, "http 5")
 }
 
 var kiroHttpStore atomic.Pointer[http.Client]
@@ -288,27 +361,40 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 
 	var primary int
 	switch preferred {
-	case "kiro":
+	case "runtime":
 		primary = 0
-	case "codewhisperer":
+	case "kiro":
 		primary = 1
-	case "amazonq":
+	case "codewhisperer":
 		primary = 2
+	case "amazonq":
+		primary = 3
 	default:
-		return []kiroEndpoint{kiroEndpoints[0], kiroEndpoints[1], kiroEndpoints[2]}
+		return []kiroEndpoint{kiroEndpoints[0]}
 	}
 
-	if !fallback {
+	if !fallback || primary == 0 {
 		return []kiroEndpoint{kiroEndpoints[primary]}
 	}
 
 	result := []kiroEndpoint{kiroEndpoints[primary]}
 	for i, ep := range kiroEndpoints {
 		if i != primary {
+			if i == 3 && primary != 3 {
+				continue
+			}
 			result = append(result, ep)
 		}
 	}
 	return result
+}
+
+func resolveKiroEndpointURL(ep kiroEndpoint, account *config.Account) string {
+	region := "us-east-1"
+	if account != nil && strings.TrimSpace(account.Region) != "" {
+		region = strings.TrimSpace(account.Region)
+	}
+	return strings.ReplaceAll(ep.URL, "{region}", region)
 }
 
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
@@ -347,101 +433,19 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
 
-	const maxRetries = 3
 	var lastErr error
-	var nextRetryDelay time.Duration
-
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			backoff := time.Duration(1<<uint(attempt)) * time.Second
-			if nextRetryDelay > backoff {
-				backoff = nextRetryDelay
-			}
-			backoff = capRetryDelay(backoff)
-			nextRetryDelay = 0
-			logger.Warnf("[KiroAPI] All endpoints rate-limited (429). Retry %d/%d after %v...", attempt, maxRetries, backoff)
-			time.Sleep(backoff)
+	for _, ep := range endpoints {
+		err := callKiroEndpoint(account, payload, callback, ep)
+		if err == nil {
+			return nil
 		}
-
-		allRateLimited := true
-
-		for _, ep := range endpoints {
-			payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
-
-			reqBody, _ := json.Marshal(payload)
-			req, err := http.NewRequest("POST", ep.URL, bytes.NewReader(reqBody))
-			if err != nil {
-				lastErr = err
-				allRateLimited = false
-				continue
-			}
-
-			host := ""
-			if parsedURL, parseErr := url.Parse(ep.URL); parseErr == nil {
-				host = parsedURL.Host
-			}
-			headerValues := buildStreamingHeaderValues(account, host)
-
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Accept", "*/*")
-			if ep.AmzTarget != "" {
-				req.Header.Set("X-Amz-Target", ep.AmzTarget)
-			}
-			applyKiroBaseHeaders(req, account, headerValues)
-			req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
-			req.Header.Set("x-amzn-codewhisperer-optout", "true")
-			req.Header.Set("Amz-Sdk-Request", fmt.Sprintf("attempt=%d; max=%d", attempt+1, maxRetries+1))
-			req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
-
-			resp, err := kiroHttpStore.Load().Do(req)
-			if err != nil {
-				lastErr = err
-				allRateLimited = false
-				logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
-				continue
-			}
-
-			if resp.StatusCode == 429 {
-				errBody, _ := io.ReadAll(resp.Body)
-				retryAfter := parseRetryAfterHeader(resp.Header.Get("Retry-After"))
-				resp.Body.Close()
-				if retryAfter > nextRetryDelay {
-					nextRetryDelay = retryAfter
-				}
-				logger.Warnf("[KiroAPI] Endpoint %s rate-limited (429), trying next...", ep.Name)
-				lastErr = &kiroHTTPError{
-					StatusCode: resp.StatusCode,
-					Endpoint:   ep.Name,
-					Body:       string(errBody),
-					RetryAfter: retryAfter,
-				}
-				continue
-			}
-
-			allRateLimited = false
-
-			if resp.StatusCode != 200 {
-				errBody, _ := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				logger.Warnf("[KiroAPI] Response HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
-				lastErr = &kiroHTTPError{
-					StatusCode: resp.StatusCode,
-					Endpoint:   ep.Name,
-					Body:       string(errBody),
-				}
-				if resp.StatusCode == 401 || resp.StatusCode == 403 {
-					return lastErr
-				}
-				continue
-			}
-
-			err = parseEventStream(resp.Body, callback)
-			resp.Body.Close()
+		lastErr = err
+		if isKiroRateLimitError(err) {
 			return err
 		}
-
-		if !allRateLimited {
-			break
+		var httpErr *kiroHTTPError
+		if errors.As(err, &httpErr) && (httpErr.StatusCode == 401 || httpErr.StatusCode == 403) {
+			return err
 		}
 	}
 
@@ -449,6 +453,120 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		return lastErr
 	}
 	return fmt.Errorf("all endpoints failed")
+}
+
+func callKiroEndpoint(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback, ep kiroEndpoint) error {
+	const maxAttempts = 3
+	var lastErr error
+	endpointURL := resolveKiroEndpointURL(ep, account)
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
+
+		reqBody, _ := json.Marshal(payload)
+		req, err := http.NewRequest("POST", endpointURL, bytes.NewReader(reqBody))
+		if err != nil {
+			return err
+		}
+
+		host := ""
+		if parsedURL, parseErr := url.Parse(endpointURL); parseErr == nil {
+			host = parsedURL.Host
+		}
+		applyKiroRequestHeaders(req, account, ep, host, attempt, maxAttempts)
+
+		resp, err := kiroHttpStore.Load().Do(req)
+		if err != nil {
+			lastErr = err
+			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
+			if attempt < maxAttempts {
+				sleepKiroRetry(ep.Name, attempt, maxAttempts, 0)
+				continue
+			}
+			return err
+		}
+
+		if resp.StatusCode == 429 {
+			errBody, _ := io.ReadAll(resp.Body)
+			retryAfter := parseRetryAfterHeader(resp.Header.Get("Retry-After"))
+			resp.Body.Close()
+			lastErr = &kiroHTTPError{
+				StatusCode: resp.StatusCode,
+				Endpoint:   ep.Name,
+				Body:       string(errBody),
+				RetryAfter: retryAfter,
+			}
+			if attempt >= maxAttempts || containsKiroTemporaryLimitSignal(string(errBody)) {
+				logger.Warnf("[KiroAPI] Endpoint %s rate-limited (429), no endpoint fanout", ep.Name)
+				return lastErr
+			}
+			sleepKiroRetry(ep.Name, attempt, maxAttempts, retryAfter)
+			continue
+		}
+
+		if resp.StatusCode >= 500 && attempt < maxAttempts {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastErr = &kiroHTTPError{
+				StatusCode: resp.StatusCode,
+				Endpoint:   ep.Name,
+				Body:       string(errBody),
+			}
+			logger.Warnf("[KiroAPI] Response HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+			sleepKiroRetry(ep.Name, attempt, maxAttempts, 0)
+			continue
+		}
+
+		if resp.StatusCode != 200 {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			logger.Warnf("[KiroAPI] Response HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+			return &kiroHTTPError{
+				StatusCode: resp.StatusCode,
+				Endpoint:   ep.Name,
+				Body:       string(errBody),
+			}
+		}
+
+		err = parseEventStream(resp.Body, callback)
+		resp.Body.Close()
+		return err
+	}
+
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("endpoint %s failed", ep.Name)
+}
+
+func applyKiroRequestHeaders(req *http.Request, account *config.Account, ep kiroEndpoint, host string, attempt, maxAttempts int) {
+	headerValues := buildStreamingHeaderValues(account, host)
+	contentType := "application/json"
+	if ep.Runtime {
+		headerValues = buildGatewayStreamingHeaderValues(account, host)
+		contentType = "application/x-amz-json-1.0"
+	}
+
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Accept", "*/*")
+	if ep.AmzTarget != "" {
+		req.Header.Set("X-Amz-Target", ep.AmzTarget)
+	}
+	applyKiroBaseHeaders(req, account, headerValues)
+	req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
+	req.Header.Set("x-amzn-codewhisperer-optout", "true")
+	req.Header.Set("Amz-Sdk-Request", fmt.Sprintf("attempt=%d; max=%d", attempt, maxAttempts))
+	req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+}
+
+func sleepKiroRetry(endpointName string, attempt, maxAttempts int, retryAfter time.Duration) {
+	backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+	if retryAfter > backoff {
+		backoff = retryAfter
+	}
+	backoff = capRetryDelay(backoff)
+	logger.Warnf("[KiroAPI] Endpoint %s retry %d/%d after %v...", endpointName, attempt+1, maxAttempts, backoff)
+	time.Sleep(backoff)
 }
 
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {

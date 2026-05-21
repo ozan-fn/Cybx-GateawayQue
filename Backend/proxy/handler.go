@@ -1042,7 +1042,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 			outputTokens = outTok
 		},
 		OnError: func(err error) {
-			h.pool.RecordError(account.ID, isKiroQuotaError(err))
+			h.recordKiroAccountError(account, err)
 		},
 		OnCredits: func(c float64) {
 			credits = c
@@ -1052,16 +1052,16 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		},
 	}
 
-	err := CallKiroAPI(account, payload, callback)
+	usedAccount, err := h.callKiroAPIWithAccountFailover(account, payload, callback)
 	if err != nil {
 		h.recordFailure()
-		h.pool.RecordError(account.ID, isKiroQuotaError(err))
 		h.sendSSE(w, flusher, "error", map[string]interface{}{
 			"type":  "error",
 			"error": map[string]string{"type": kiroClaudeErrorType(err), "message": err.Error()},
 		})
 		return
 	}
+	account = usedAccount
 
 	processClaudeText("", false, true)
 	if eventThinkingOpen {
@@ -1202,6 +1202,92 @@ func (h *Handler) recordFailure() {
 	atomic.AddInt64(&h.failedRequests, 1)
 }
 
+func (h *Handler) recordKiroAccountError(account *config.Account, err error) {
+	if account == nil {
+		return
+	}
+	if isKiroRateLimitError(err) {
+		h.pool.RecordRateLimit(account.ID, kiroAccountCooldown(err))
+		return
+	}
+	h.pool.RecordError(account.ID, isKiroQuotaError(err))
+}
+
+func (h *Handler) callKiroAPIWithAccountFailover(initial *config.Account, payload *KiroPayload, callback *KiroStreamCallback) (*config.Account, error) {
+	maxAttempts := h.pool.Count()
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	tried := make(map[string]bool)
+	account := initial
+	var lastErr error
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if account == nil || tried[account.ID] {
+			account = h.pool.GetNextReadyExcluding(tried)
+		}
+		if account == nil {
+			break
+		}
+		tried[account.ID] = true
+
+		if err := h.ensureValidToken(account); err != nil {
+			lastErr = err
+			h.recordKiroAccountError(account, err)
+			account = nil
+			continue
+		}
+
+		payload.ProfileArn = strings.TrimSpace(account.ProfileArn)
+
+		streamStarted := false
+		activeCallback := wrapKiroStreamStartedCallback(callback, &streamStarted)
+		err := CallKiroAPI(account, payload, activeCallback)
+		if err == nil {
+			return account, nil
+		}
+
+		lastErr = err
+		h.recordKiroAccountError(account, err)
+		if streamStarted || !isKiroAccountFailoverError(err) {
+			return account, err
+		}
+
+		logger.Warnf("[KiroAPI] Account %s failed with %v; trying another account", account.Email, err)
+		account = nil
+	}
+
+	if lastErr != nil {
+		return nil, fmt.Errorf("all available accounts failed after %d attempt(s): %w", len(tried), lastErr)
+	}
+	return nil, fmt.Errorf("no available accounts after %d attempt(s)", len(tried))
+}
+
+func wrapKiroStreamStartedCallback(callback *KiroStreamCallback, started *bool) *KiroStreamCallback {
+	if callback == nil {
+		return nil
+	}
+	wrapped := *callback
+	onText := callback.OnText
+	wrapped.OnText = func(text string, isThinking bool) {
+		if text != "" {
+			*started = true
+		}
+		if onText != nil {
+			onText(text, isThinking)
+		}
+	}
+	onToolUse := callback.OnToolUse
+	wrapped.OnToolUse = func(toolUse KiroToolUse) {
+		*started = true
+		if onToolUse != nil {
+			onToolUse(toolUse)
+		}
+	}
+	return &wrapped
+}
+
 func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile) {
 	var content string
 	var thinkingContent string
@@ -1226,7 +1312,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 			outputTokens = outTok
 		},
 		OnError: func(err error) {
-			h.pool.RecordError(account.ID, isKiroQuotaError(err))
+			h.recordKiroAccountError(account, err)
 		},
 		OnCredits: func(c float64) {
 			credits = c
@@ -1236,13 +1322,13 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 		},
 	}
 
-	err := CallKiroAPI(account, payload, callback)
+	usedAccount, err := h.callKiroAPIWithAccountFailover(account, payload, callback)
 	if err != nil {
 		h.recordFailure()
-		h.pool.RecordError(account.ID, isKiroQuotaError(err))
 		h.sendClaudeError(w, kiroErrorStatus(err, 500), kiroClaudeErrorType(err), err.Error())
 		return
 	}
+	account = usedAccount
 
 	thinkingFormat := thinkingOpts.Format
 	finalContent, extractedReasoning := extractThinkingFromContent(content)
@@ -1649,7 +1735,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 			outputTokens = outTok
 		},
 		OnError: func(err error) {
-			h.pool.RecordError(account.ID, isKiroQuotaError(err))
+			h.recordKiroAccountError(account, err)
 		},
 		OnCredits: func(c float64) {
 			credits = c
@@ -1659,13 +1745,13 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		},
 	}
 
-	err := CallKiroAPI(account, payload, callback)
+	usedAccount, err := h.callKiroAPIWithAccountFailover(account, payload, callback)
 	if err != nil {
 		h.recordFailure()
-		h.pool.RecordError(account.ID, isKiroQuotaError(err))
 		h.sendOpenAIStreamError(w, flusher, kiroOpenAIErrorType(err), err.Error())
 		return
 	}
+	account = usedAccount
 
 	processText("", false, true)
 	if eventThinkingOpen {
@@ -1742,20 +1828,20 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 		},
 		OnToolUse:  func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
 		OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
-		OnError:    func(err error) { h.pool.RecordError(account.ID, isKiroQuotaError(err)) },
+		OnError:    func(err error) { h.recordKiroAccountError(account, err) },
 		OnCredits:  func(c float64) { credits = c },
 		OnContextUsage: func(pct float64) {
 			realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 		},
 	}
 
-	err := CallKiroAPI(account, payload, callback)
+	usedAccount, err := h.callKiroAPIWithAccountFailover(account, payload, callback)
 	if err != nil {
 		h.recordFailure()
-		h.pool.RecordError(account.ID, isKiroQuotaError(err))
 		h.sendOpenAIError(w, kiroErrorStatus(err, 500), kiroOpenAIErrorType(err), err.Error())
 		return
 	}
+	account = usedAccount
 
 	finalContent, extractedReasoning := extractThinkingFromContent(content)
 	if thinking && reasoningContent == "" && extractedReasoning != "" {

@@ -112,6 +112,47 @@ func (p *AccountPool) GetNext() *config.Account {
 	return best
 }
 
+func (p *AccountPool) GetNextReadyExcluding(excluded map[string]bool) *config.Account {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if len(p.accounts) == 0 {
+		return nil
+	}
+
+	now := time.Now()
+	n := len(p.accounts)
+	seen := make(map[string]bool)
+
+	for i := 0; i < n; i++ {
+		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
+		acc := &p.accounts[idx]
+
+		if seen[acc.ID] || (excluded != nil && excluded[acc.ID]) {
+			continue
+		}
+
+		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+			seen[acc.ID] = true
+			continue
+		}
+
+		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-300 {
+			seen[acc.ID] = true
+			continue
+		}
+
+		if isOverUsageLimit(*acc) && !acc.AllowOverage {
+			seen[acc.ID] = true
+			continue
+		}
+
+		return acc
+	}
+
+	return nil
+}
+
 func (p *AccountPool) GetByID(id string) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -141,6 +182,20 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	} else if p.errorCounts[id] >= 3 {
 		p.cooldowns[id] = time.Now().Add(time.Minute)
 	}
+}
+
+func (p *AccountPool) RecordRateLimit(id string, cooldown time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.errorCounts[id]++
+	if cooldown <= 0 {
+		cooldown = time.Minute
+	}
+	if cooldown > time.Hour {
+		cooldown = time.Hour
+	}
+	p.cooldowns[id] = time.Now().Add(cooldown)
 }
 
 func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresAt int64) {

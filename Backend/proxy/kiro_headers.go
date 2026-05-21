@@ -9,6 +9,10 @@ import (
 const (
 	kiroStreamingSDKVersion = "1.0.34"
 	kiroRuntimeSDKVersion   = "1.0.0"
+	kiroGatewaySDKVersion   = "1.0.27"
+	kiroGatewayKiroVersion  = "0.7.45"
+	kiroGatewayNodeVersion  = "22.21.1"
+	kiroGatewaySystem       = "win32#10.0.19044"
 )
 
 type kiroHeaderValues struct {
@@ -23,6 +27,29 @@ func buildStreamingHeaderValues(account *config.Account, host string) kiroHeader
 
 func buildRuntimeHeaderValues(account *config.Account, host string) kiroHeaderValues {
 	return buildKiroHeaderValues(account, host, "codewhispererruntime", kiroRuntimeSDKVersion, "m/N,E")
+}
+
+func buildGatewayStreamingHeaderValues(account *config.Account, host string) kiroHeaderValues {
+	machineID := ""
+	if account != nil {
+		machineID = account.MachineId
+	}
+	kiroVersion := kiroGatewayKiroVersion
+	if machineID != "" {
+		kiroVersion += "-" + machineID
+	}
+	return kiroHeaderValues{
+		UserAgent: fmt.Sprintf(
+			"aws-sdk-js/%s ua/2.1 os/%s lang/js md/nodejs#%s api/codewhispererstreaming#%s m/E KiroIDE-%s",
+			kiroGatewaySDKVersion,
+			kiroGatewaySystem,
+			kiroGatewayNodeVersion,
+			kiroGatewaySDKVersion,
+			kiroVersion,
+		),
+		AmzUserAgent: fmt.Sprintf("aws-sdk-js/%s KiroIDE-%s", kiroGatewaySDKVersion, kiroVersion),
+		Host:         host,
+	}
 }
 
 func buildKiroHeaderValues(account *config.Account, host, apiName, sdkVersion, mode string) kiroHeaderValues {
