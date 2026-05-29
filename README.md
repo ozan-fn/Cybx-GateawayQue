@@ -637,7 +637,7 @@ Jika ada keperluan, kerja sama, pertanyaan, atau support request, silakan hubung
 
 | Platform | Kontak |
 |----------|--------|
-| <img src="https://cdn.simpleicons.org/discord/5865F2" width="18" alt="Discord" /> Discord | `cybh22` |
+| <img src="https://cdn.simpleicons.org/discord/5865F2" width="18" alt="Discord" /> Discord | [cybh22](https://discord.com/users/1382950414713884703) |
 | <img src="https://cdn.simpleicons.org/telegram/26A5E4" width="18" alt="Telegram" /> Telegram | [@Cyb192](https://t.me/Cyb192) |
 
 ---
