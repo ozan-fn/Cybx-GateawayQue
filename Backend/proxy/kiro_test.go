@@ -199,7 +199,7 @@ func TestCallKiroAPIWithAccountFailoverRetriesAnotherAccount(t *testing.T) {
 	payload := minimalKiroPayload()
 	payload.ProfileArn = "arn:test"
 
-	used, err := handler.callKiroAPIWithAccountFailover(nil, payload, &KiroStreamCallback{
+	used, err := handler.callKiroAPIWithAccountFailover("claude-opus-4.7", nil, payload, &KiroStreamCallback{
 		OnComplete: func(int, int) {},
 	})
 	if err != nil {
@@ -213,6 +213,23 @@ func TestCallKiroAPIWithAccountFailoverRetriesAnotherAccount(t *testing.T) {
 	}
 	if calls[0] == calls[1] {
 		t.Fatalf("expected failover to use a different account")
+	}
+}
+
+func TestGetContextWindowSizeHandlesFutureClaudeVersions(t *testing.T) {
+	tests := map[string]int{
+		"claude-opus-4.8":          1_000_000,
+		"claude-opus-4-8":          1_000_000,
+		"claude-sonnet-5-0":        1_000_000,
+		"claude-haiku-4.5":         200_000,
+		"claude-sonnet-4.5":        200_000,
+		"claude-opus-4.8-thinking": 1_000_000,
+	}
+
+	for model, want := range tests {
+		if got := getContextWindowSize(model); got != want {
+			t.Fatalf("%s: expected %d, got %d", model, want, got)
+		}
 	}
 }
 

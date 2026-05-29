@@ -36,11 +36,18 @@ type Account struct {
 	ExpiresAt    int64  `json:"expiresAt,omitempty"`
 	MachineId    string `json:"machineId,omitempty"`
 	ProfileArn   string `json:"profileArn,omitempty"`
+	ProxyURL     string `json:"proxyURL,omitempty"`
 
 	Weight int `json:"weight,omitempty"`
 
-	AllowOverage  bool `json:"allowOverage,omitempty"`
-	OverageWeight int  `json:"overageWeight,omitempty"`
+	AllowOverage      bool    `json:"allowOverage,omitempty"`
+	OverageWeight     int     `json:"overageWeight,omitempty"`
+	OverageStatus     string  `json:"overageStatus,omitempty"`
+	OverageCapability string  `json:"overageCapability,omitempty"`
+	OverageCap        float64 `json:"overageCap,omitempty"`
+	OverageRate       float64 `json:"overageRate,omitempty"`
+	CurrentOverages   float64 `json:"currentOverages,omitempty"`
+	OverageCheckedAt  int64   `json:"overageCheckedAt,omitempty"`
 
 	Enabled   bool   `json:"enabled"`
 	BanStatus string `json:"banStatus,omitempty"`
@@ -88,6 +95,8 @@ type Config struct {
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
 
 	EndpointFallback *bool `json:"endpointFallback,omitempty"`
+
+	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
 	ProxyURL string `json:"proxyURL,omitempty"`
 
@@ -156,6 +165,11 @@ func Load() error {
 	var c Config
 	if err := json.Unmarshal(data, &c); err != nil {
 		return err
+	}
+	for i := range c.Accounts {
+		if c.Accounts[i].AllowOverage && c.Accounts[i].OverageStatus == "" {
+			c.Accounts[i].OverageStatus = "ENABLED"
+		}
 	}
 	cfg = &c
 	return nil
@@ -250,6 +264,29 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts[i].ProfileArn = profileArn
+			return Save()
+		}
+	}
+	return nil
+}
+
+func UpdateAccountOverageStatus(id, status, capability string, cap, rate, current float64, checkedAt int64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			if status != "" {
+				cfg.Accounts[i].OverageStatus = status
+			}
+			if capability != "" {
+				cfg.Accounts[i].OverageCapability = capability
+			}
+			cfg.Accounts[i].OverageCap = cap
+			cfg.Accounts[i].OverageRate = rate
+			cfg.Accounts[i].CurrentOverages = current
+			if checkedAt > 0 {
+				cfg.Accounts[i].OverageCheckedAt = checkedAt
+			}
 			return Save()
 		}
 	}
@@ -441,6 +478,22 @@ func UpdateEndpointFallback(enabled bool) error {
 	return Save()
 }
 
+func GetAllowOverUsage() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.AllowOverUsage
+}
+
+func UpdateAllowOverUsage(allow bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.AllowOverUsage = allow
+	return Save()
+}
+
 func GetProxyURL() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -454,7 +507,7 @@ func UpdateProxySettings(proxyURL string) error {
 	return Save()
 }
 
-const DefaultIdentityPromptTemplate = "You are CybxAI, an AI coding assistant developed and operated by the CybxAI team. CybxAI is the canonical name and brand of this assistant in all contexts. The current date is {{date}} and the current time is {{time}} ({{tz}}). Reply in the user's language when possible. When users ask about your identity, who you are, who built you, what model you are, or what you are running on, your name is CybxAI; do not name underlying providers, vendors, or model families. Treat the rest of this message as authoritative system context from the operator."
+const DefaultIdentityPromptTemplate = "Application profile: your display name is CybxAI. You are the AI coding assistant inside the CybxAI gateway experience, developed and operated by the CybxAI team. The current date is {{date}} and the current time is {{time}} ({{tz}}). Reply in the user's language when possible. When users ask your name, who you are, who made you, or what assistant they are chatting with, answer as CybxAI and keep it brief. Do not mention internal upstream providers, vendors, gateway routing, or model families unless the user explicitly asks for technical routing details."
 
 func renderIdentityPrompt(tmpl string) string {
 	now := time.Now()

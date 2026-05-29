@@ -1,6 +1,9 @@
 package proxy
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestThinkingSourceReasoningFirst(t *testing.T) {
 	var source thinkingStreamSource
@@ -96,6 +99,22 @@ func TestValidateClaudeRequestShapeRejectsAssistantPrefill(t *testing.T) {
 
 	if msg := validateClaudeRequestShape(req); msg == "" {
 		t.Fatalf("expected assistant-prefill final message to be rejected")
+	}
+}
+
+func TestLocalIdentityAnswerHandlesLeetspeakIndonesian(t *testing.T) {
+	answer, ok := localIdentityAnswer("si4p4 km")
+	if !ok {
+		t.Fatalf("expected identity answer")
+	}
+	if !strings.Contains(answer, "CybxAI") {
+		t.Fatalf("expected CybxAI answer, got %q", answer)
+	}
+}
+
+func TestLocalIdentityAnswerDoesNotCatchNormalRequests(t *testing.T) {
+	if answer, ok := localIdentityAnswer("bisakah kamu bantu debug kode ini"); ok {
+		t.Fatalf("expected no local identity answer, got %q", answer)
 	}
 }
 

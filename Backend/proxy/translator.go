@@ -17,21 +17,8 @@ type modelMapping struct {
 	value string
 }
 
-var modelMapOrdered = []modelMapping{
+var modelAliases = []modelMapping{
 	{"claude-sonnet-4-20250514", "claude-sonnet-4"},
-	{"claude-sonnet-4-5", "claude-sonnet-4.5"},
-	{"claude-sonnet-4.5", "claude-sonnet-4.5"},
-	{"claude-sonnet-4-6", "claude-sonnet-4.6"},
-	{"claude-sonnet-4.6", "claude-sonnet-4.6"},
-	{"claude-opus-4-7", "claude-opus-4.7"},
-	{"claude-opus-4.7", "claude-opus-4.7"},
-	{"claude-haiku-4-5", "claude-haiku-4.5"},
-	{"claude-haiku-4.5", "claude-haiku-4.5"},
-	{"claude-opus-4-5", "claude-opus-4.5"},
-	{"claude-opus-4.5", "claude-opus-4.5"},
-	{"claude-opus-4-6", "claude-opus-4.6"},
-	{"claude-opus-4.6", "claude-opus-4.6"},
-	{"claude-sonnet-4", "claude-sonnet-4"},
 	{"claude-3-5-sonnet", "claude-sonnet-4.5"},
 	{"claude-3-opus", "claude-sonnet-4.5"},
 	{"claude-3-sonnet", "claude-sonnet-4"},
@@ -42,6 +29,8 @@ var modelMapOrdered = []modelMapping{
 	{"gpt-3.5-turbo", "claude-sonnet-4.5"},
 }
 
+var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})\b`)
+
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
 
@@ -49,6 +38,7 @@ const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
 
 func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
+	model = normalizeClientModelID(model)
 	lower := strings.ToLower(model)
 	thinking := false
 
@@ -59,10 +49,17 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 		lower = strings.ToLower(model)
 	}
 
-	for _, m := range modelMapOrdered {
+	model = resolveCustomUpstreamModel(model)
+	lower = strings.ToLower(model)
+
+	for _, m := range modelAliases {
 		if strings.Contains(lower, m.key) {
 			return m.value, thinking
 		}
+	}
+
+	if claudeVersionPattern.MatchString(lower) {
+		return claudeVersionPattern.ReplaceAllString(lower, "claude-$1-$2.$3"), thinking
 	}
 
 	if strings.HasPrefix(lower, "claude-") {
@@ -70,6 +67,33 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 	}
 
 	return model, thinking
+}
+
+func normalizeClientModelID(model string) string {
+	model = strings.TrimSpace(model)
+	lower := strings.ToLower(model)
+	if strings.HasPrefix(lower, "cybxai/") {
+		model = model[len("cybxai/"):]
+		lower = strings.ToLower(model)
+	}
+	if strings.HasPrefix(lower, "kr/") {
+		model = model[len("kr/"):]
+	}
+	return model
+}
+
+func resolveCustomUpstreamModel(model string) string {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	if normalized == "" {
+		return model
+	}
+	for _, custom := range loadCustomModels() {
+		id := strings.ToLower(normalizeClientModelID(custom.ID))
+		if id == normalized && strings.TrimSpace(custom.UpstreamModel) != "" {
+			return normalizeClientModelID(custom.UpstreamModel)
+		}
+	}
+	return model
 }
 
 func resolveClaudeThinkingMode(model string, thinkingCfg *ClaudeThinkingConfig, thinkingSuffix string) (string, bool) {

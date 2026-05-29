@@ -45,6 +45,26 @@ func TestOverageAccountsCanBeSelectedWhenAllowed(t *testing.T) {
 	}
 }
 
+func TestOverageAccountsCanBeSelectedWhenUpstreamEnabled(t *testing.T) {
+	p := &AccountPool{}
+	overLimit := config.Account{
+		ID:            "over",
+		UsageCurrent:  10,
+		UsageLimit:    10,
+		OverageStatus: "ENABLED",
+	}
+
+	p.accounts = []config.Account{overLimit}
+
+	acc := p.GetNext()
+	if acc == nil {
+		t.Fatalf("expected upstream overage account")
+	}
+	if acc.ID != "over" {
+		t.Fatalf("expected overage account, got %q", acc.ID)
+	}
+}
+
 func TestOverageWeightIsLowerThanNormalWeight(t *testing.T) {
 	normalWeight := effectiveWeight(1) * overageFrequencyScale
 	overageWeight := effectiveOverageWeight(1)
@@ -88,5 +108,29 @@ func TestExpiredAccountsAreStillSelectableForRefresh(t *testing.T) {
 	}
 	if acc.ID != "expired" {
 		t.Fatalf("expected expired account, got %q", acc.ID)
+	}
+}
+
+func TestGetNextForModelExcludingUsesAccountModelCache(t *testing.T) {
+	p := &AccountPool{
+		accounts: []config.Account{
+			{ID: "sonnet"},
+			{ID: "opus"},
+		},
+	}
+	p.SetModelList("sonnet", []string{"claude-sonnet-4.5"})
+	p.SetModelList("opus", []string{"claude-opus-4.8"})
+
+	acc := p.GetNextForModelExcluding("kr/claude-opus-4.8", nil)
+	if acc == nil {
+		t.Fatalf("expected account")
+	}
+	if acc.ID != "opus" {
+		t.Fatalf("expected opus account, got %q", acc.ID)
+	}
+
+	acc = p.GetNextForModelExcluding("claude-opus-4.8", map[string]bool{"opus": true})
+	if acc != nil {
+		t.Fatalf("expected nil when only matching account is excluded, got %q", acc.ID)
 	}
 }

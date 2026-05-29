@@ -452,6 +452,8 @@ func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
 	return []map[string]interface{}{
 		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
 		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-opus-4.8", "anthropic", true),
+		buildModelInfo("claude-opus-4.8"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-opus-4.6", "anthropic", true),
 		buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-opus-4.7", "anthropic", true),
@@ -477,6 +479,7 @@ func fallbackRuntimeModelInfos() []ModelInfo {
 		"claude-opus-4.5",
 		"claude-opus-4.6",
 		"claude-opus-4.7",
+		"claude-opus-4.8",
 		"deepseek-3.2",
 		"glm-5",
 		"minimax-m2.1",
@@ -551,29 +554,25 @@ func (h *Handler) refreshModelsCache() {
 		return
 	}
 
-	if useRuntimeModelFallback() {
-		models := fallbackRuntimeModelInfos()
-		h.modelsCacheMu.Lock()
-		h.cachedModels = models
-		h.modelsCacheTime = time.Now().Unix()
-		h.modelsCacheMu.Unlock()
-		logger.Infof("[ModelsCache] Cached %d runtime fallback models", len(models))
-		return
-	}
-
 	aggregated := make([]ModelInfo, 0)
 	for i := range accounts {
 		account := &accounts[i]
 		if err := h.ensureValidToken(account); err != nil {
 			logger.Warnf("[ModelsCache] Skip %s token refresh failed: %v", account.Email, err)
+			h.handleAccountFailure(account, err)
 			continue
 		}
 
 		models, err := ListAvailableModels(account)
 		if err != nil {
 			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", account.Email, err)
+			h.handleAccountFailure(account, err)
 			continue
 		}
+		if useRuntimeModelFallback() {
+			models = mergeUniqueModels(models, fallbackRuntimeModelInfos())
+		}
+		h.pool.SetModelList(account.ID, modelIDsFromModelInfos(models))
 		aggregated = mergeUniqueModels(aggregated, models)
 	}
 
@@ -583,7 +582,52 @@ func (h *Handler) refreshModelsCache() {
 		h.modelsCacheTime = time.Now().Unix()
 		h.modelsCacheMu.Unlock()
 		logger.Infof("[ModelsCache] Cached %d models", len(aggregated))
+		return
 	}
+
+	if useRuntimeModelFallback() {
+		models := fallbackRuntimeModelInfos()
+		for i := range accounts {
+			h.pool.SetModelList(accounts[i].ID, modelIDsFromModelInfos(models))
+		}
+		h.modelsCacheMu.Lock()
+		h.cachedModels = models
+		h.modelsCacheTime = time.Now().Unix()
+		h.modelsCacheMu.Unlock()
+		logger.Infof("[ModelsCache] Cached %d runtime fallback models", len(models))
+	}
+}
+
+func modelIDsFromModelInfos(models []ModelInfo) []string {
+	ids := make([]string, 0, len(models))
+	for _, m := range models {
+		if strings.TrimSpace(m.ModelId) != "" {
+			ids = append(ids, m.ModelId)
+		}
+	}
+	return ids
+}
+
+func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
+	if err := h.ensureValidToken(account); err != nil {
+		return fmt.Errorf("token refresh failed: %w", err)
+	}
+	models, err := ListAvailableModels(account)
+	if err != nil {
+		return err
+	}
+	if useRuntimeModelFallback() {
+		models = mergeUniqueModels(models, fallbackRuntimeModelInfos())
+	}
+	h.pool.SetModelList(account.ID, modelIDsFromModelInfos(models))
+
+	h.modelsCacheMu.Lock()
+	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
+	h.modelsCacheTime = time.Now().Unix()
+	h.modelsCacheMu.Unlock()
+
+	logger.Infof("[ModelsCache] Refreshed %d models for account %s", len(models), account.Email)
+	return nil
 }
 
 func mergeUniqueModels(existing []ModelInfo, incoming []ModelInfo) []ModelInfo {
@@ -718,12 +762,6 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	account := h.pool.GetNext()
-	if account == nil {
-		h.sendClaudeError(w, 503, "api_error", "No available accounts")
-		return
-	}
-
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
@@ -731,6 +769,12 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
+
+	account := h.pool.GetNextForModel(req.Model)
+	if account == nil {
+		h.sendClaudeError(w, 503, "api_error", "No available accounts for model "+req.Model)
+		return
+	}
 	cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 	kiroPayload := ClaudeToKiro(&req, thinking)
@@ -1097,7 +1141,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	}
 
 	initialAccountID := account.ID
-	usedAccount, err := h.callKiroAPIWithAccountFailover(account, payload, callback)
+	usedAccount, err := h.callKiroAPIWithAccountFailover(model, account, payload, callback)
 	if err != nil {
 		h.recordFailure()
 		h.sendSSE(w, flusher, "error", map[string]interface{}{
@@ -1252,14 +1296,10 @@ func (h *Handler) recordKiroAccountError(account *config.Account, err error) {
 	if account == nil {
 		return
 	}
-	if isKiroRateLimitError(err) {
-		h.pool.RecordRateLimit(account.ID, kiroAccountCooldown(err))
-		return
-	}
-	h.pool.RecordError(account.ID, isKiroQuotaError(err))
+	h.handleAccountFailure(account, err)
 }
 
-func (h *Handler) callKiroAPIWithAccountFailover(initial *config.Account, payload *KiroPayload, callback *KiroStreamCallback) (*config.Account, error) {
+func (h *Handler) callKiroAPIWithAccountFailover(model string, initial *config.Account, payload *KiroPayload, callback *KiroStreamCallback) (*config.Account, error) {
 	maxAttempts := h.pool.Count()
 	if maxAttempts < 1 {
 		maxAttempts = 1
@@ -1271,7 +1311,7 @@ func (h *Handler) callKiroAPIWithAccountFailover(initial *config.Account, payloa
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if account == nil || tried[account.ID] {
-			account = h.pool.GetNextReadyExcluding(tried)
+			account = h.pool.GetNextForModelExcluding(model, tried)
 		}
 		if account == nil {
 			break
@@ -1369,7 +1409,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 	}
 
 	initialAccountID := account.ID
-	usedAccount, err := h.callKiroAPIWithAccountFailover(account, payload, callback)
+	usedAccount, err := h.callKiroAPIWithAccountFailover(model, account, payload, callback)
 	if err != nil {
 		h.recordFailure()
 		h.sendClaudeError(w, kiroErrorStatus(err, 500), kiroClaudeErrorType(err), err.Error())
@@ -1467,9 +1507,12 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account := h.pool.GetNext()
-	if account == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+	if answer, ok := localIdentityAnswer(latestOpenAIUserText(req.Messages)); ok {
+		if req.Stream {
+			h.sendOpenAIIdentityStream(w, req.Model, answer)
+		} else {
+			h.sendOpenAIIdentityResponse(w, req.Model, answer)
+		}
 		return
 	}
 
@@ -1479,6 +1522,12 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
+
+	account := h.pool.GetNextForModel(req.Model)
+	if account == nil {
+		h.sendOpenAIError(w, 503, "server_error", "No available accounts for model "+req.Model)
+		return
+	}
 
 	_usageTee := newResponseTee(w, 64*1024)
 	w = _usageTee
@@ -1793,7 +1842,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	}
 
 	initialAccountID := account.ID
-	usedAccount, err := h.callKiroAPIWithAccountFailover(account, payload, callback)
+	usedAccount, err := h.callKiroAPIWithAccountFailover(model, account, payload, callback)
 	if err != nil {
 		h.recordFailure()
 		h.sendOpenAIStreamError(w, flusher, kiroOpenAIErrorType(err), err.Error())
@@ -1885,7 +1934,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 	}
 
 	initialAccountID := account.ID
-	usedAccount, err := h.callKiroAPIWithAccountFailover(account, payload, callback)
+	usedAccount, err := h.callKiroAPIWithAccountFailover(model, account, payload, callback)
 	if err != nil {
 		h.recordFailure()
 		h.sendOpenAIError(w, kiroErrorStatus(err, 500), kiroOpenAIErrorType(err), err.Error())
@@ -1942,6 +1991,121 @@ func (h *Handler) sendOpenAIStreamError(w http.ResponseWriter, flusher http.Flus
 	flusher.Flush()
 }
 
+func (h *Handler) sendOpenAIIdentityResponse(w http.ResponseWriter, model, content string) {
+	if strings.TrimSpace(model) == "" {
+		model = "cybxai"
+	}
+	outputTokens := estimateApproxTokens(content)
+	resp := KiroToOpenAIResponse(content, nil, 0, outputTokens, model)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (h *Handler) sendOpenAIIdentityStream(w http.ResponseWriter, model, content string) {
+	if strings.TrimSpace(model) == "" {
+		model = "cybxai"
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		h.sendOpenAIError(w, 500, "server_error", "Streaming not supported")
+		return
+	}
+
+	chatID := "chatcmpl-" + uuid.New().String()
+	chunk := map[string]interface{}{
+		"id":      chatID,
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]interface{}{{
+			"index": 0,
+			"delta": map[string]interface{}{
+				"role":    "assistant",
+				"content": content,
+			},
+			"finish_reason": nil,
+		}},
+	}
+	data, _ := json.Marshal(chunk)
+	fmt.Fprintf(w, "data: %s\n\n", string(data))
+
+	done := map[string]interface{}{
+		"id":      chatID,
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]interface{}{{
+			"index":         0,
+			"delta":         map[string]interface{}{},
+			"finish_reason": "stop",
+		}},
+	}
+	doneData, _ := json.Marshal(done)
+	fmt.Fprintf(w, "data: %s\n\n", string(doneData))
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+func latestOpenAIUserText(messages []OpenAIMessage) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			return extractOpenAIMessageText(messages[i].Content)
+		}
+	}
+	return ""
+}
+
+func localIdentityAnswer(text string) (string, bool) {
+	normalized := normalizeIdentityQuestion(text)
+	if normalized == "" {
+		return "", false
+	}
+	indonesian := strings.Contains(normalized, "siapa kamu") ||
+		strings.Contains(normalized, "siapa km") ||
+		strings.Contains(normalized, "kamu siapa") ||
+		strings.Contains(normalized, "km siapa") ||
+		strings.Contains(normalized, "siapakah kamu") ||
+		strings.Contains(normalized, "nama kamu") ||
+		strings.Contains(normalized, "namamu") ||
+		strings.Contains(normalized, "siapa namamu")
+	english := strings.Contains(normalized, "who are you") ||
+		strings.Contains(normalized, "what are you") ||
+		strings.Contains(normalized, "your name") ||
+		strings.Contains(normalized, "who made you") ||
+		strings.Contains(normalized, "are you kiro") ||
+		strings.Contains(normalized, "are you cybxai")
+	modelQuestion := strings.Contains(normalized, "model apa") ||
+		strings.Contains(normalized, "what model") ||
+		strings.Contains(normalized, "model are you")
+	if !indonesian && !english && !modelQuestion {
+		return "", false
+	}
+	if english && !indonesian {
+		return "I'm CybxAI, the AI coding assistant in this workspace.", true
+	}
+	return "Saya CybxAI, asisten AI coding di workspace ini.", true
+}
+
+func normalizeIdentityQuestion(text string) string {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if text == "" {
+		return ""
+	}
+	replacer := strings.NewReplacer(
+		"4", "a",
+		"3", "e",
+		"1", "i",
+		"0", "o",
+		"@", "a",
+	)
+	text = replacer.Replace(text)
+	return strings.Join(strings.Fields(text), " ")
+}
+
 func (h *Handler) ensureValidToken(account *config.Account) error {
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-300 {
 		return nil
@@ -1993,6 +2157,20 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiAddAccount(w, r)
 	case path == "/accounts/batch" && r.Method == "POST":
 		h.apiBatchAccounts(w, r)
+	case path == "/accounts/models/refresh" && r.Method == "POST":
+		h.apiRefreshAllAccountsModels(w, r)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/refresh") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/refresh")
+		h.apiRefreshAccountModels(w, r, id)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/cached") && r.Method == "GET":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/cached")
+		h.apiGetAccountModelsCached(w, r, id)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/overage") && r.Method == "GET":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/overage")
+		h.apiGetAccountOverage(w, r, id)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/overage") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/overage")
+		h.apiSetAccountOverage(w, r, id)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/refresh") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/refresh")
 		h.apiRefreshAccount(w, r, id)
@@ -2073,6 +2251,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"authMethod":        a.AuthMethod,
 			"provider":          a.Provider,
 			"region":            a.Region,
+			"proxyURL":          a.ProxyURL,
 			"enabled":           a.Enabled,
 			"banStatus":         a.BanStatus,
 			"banReason":         a.BanReason,
@@ -2083,6 +2262,12 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"weight":            a.Weight,
 			"allowOverage":      a.AllowOverage,
 			"overageWeight":     a.OverageWeight,
+			"overageStatus":     a.OverageStatus,
+			"overageCapability": a.OverageCapability,
+			"overageCap":        a.OverageCap,
+			"overageRate":       a.OverageRate,
+			"currentOverages":   a.CurrentOverages,
+			"overageCheckedAt":  a.OverageCheckedAt,
 			"subscriptionType":  a.SubscriptionType,
 			"subscriptionTitle": a.SubscriptionTitle,
 			"daysRemaining":     a.DaysRemaining,
@@ -2119,6 +2304,11 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	if account.Region == "" {
 		account.Region = "us-east-1"
+	}
+	if account.ProxyURL != "" && !isValidProxyURL(account.ProxyURL) {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "proxyURL must start with http://, https://, socks5://, or socks5h://"})
+		return
 	}
 
 	if err := config.AddAccount(account); err != nil {
@@ -2172,6 +2362,14 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	if v, ok := updates["machineId"].(string); ok {
 		existing.MachineId = v
 	}
+	if v, ok := updates["proxyURL"].(string); ok {
+		if v != "" && !isValidProxyURL(v) {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "proxyURL must start with http://, https://, socks5://, or socks5h://"})
+			return
+		}
+		existing.ProxyURL = v
+	}
 	if v, ok := updates["weight"].(float64); ok {
 		existing.Weight = int(v)
 	}
@@ -2180,6 +2378,9 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 	if v, ok := updates["overageWeight"].(float64); ok {
 		existing.OverageWeight = clampInt(int(v), 1, 10)
+	}
+	if v, ok := updates["overageStatus"].(string); ok {
+		existing.OverageStatus = strings.ToUpper(strings.TrimSpace(v))
 	}
 
 	if err := config.UpdateAccount(id, *existing); err != nil {
@@ -2651,18 +2852,20 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":        config.GetApiKey(),
-		"requireApiKey": config.IsApiKeyRequired(),
-		"port":          config.GetPort(),
-		"host":          config.GetHost(),
+		"apiKey":         config.GetApiKey(),
+		"requireApiKey":  config.IsApiKeyRequired(),
+		"port":           config.GetPort(),
+		"host":           config.GetHost(),
+		"allowOverUsage": config.GetAllowOverUsage(),
 	})
 }
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey        string `json:"apiKey"`
-		RequireApiKey bool   `json:"requireApiKey"`
-		Password      string `json:"password"`
+		ApiKey         string `json:"apiKey"`
+		RequireApiKey  bool   `json:"requireApiKey"`
+		Password       string `json:"password"`
+		AllowOverUsage *bool  `json:"allowOverUsage,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -2674,6 +2877,14 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
+	}
+	if req.AllowOverUsage != nil {
+		if err := config.UpdateAllowOverUsage(*req.AllowOverUsage); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		h.pool.Reload()
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
@@ -2836,11 +3047,18 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"authMethod":        account.AuthMethod,
 		"provider":          account.Provider,
 		"region":            account.Region,
+		"proxyURL":          account.ProxyURL,
 		"expiresAt":         account.ExpiresAt,
 		"machineId":         account.MachineId,
 		"weight":            account.Weight,
 		"allowOverage":      account.AllowOverage,
 		"overageWeight":     account.OverageWeight,
+		"overageStatus":     account.OverageStatus,
+		"overageCapability": account.OverageCapability,
+		"overageCap":        account.OverageCap,
+		"overageRate":       account.OverageRate,
+		"currentOverages":   account.CurrentOverages,
+		"overageCheckedAt":  account.OverageCheckedAt,
 		"enabled":           account.Enabled,
 		"banStatus":         account.BanStatus,
 		"banReason":         account.BanReason,
@@ -2884,21 +3102,183 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
-	models := fallbackRuntimeModelInfos()
-	if !useRuntimeModelFallback() {
-		var err error
-		models, err = ListAvailableModels(account)
-		if err != nil {
+	if latest := h.pool.GetByID(id); latest != nil {
+		account.AccessToken = latest.AccessToken
+		account.RefreshToken = latest.RefreshToken
+		account.ExpiresAt = latest.ExpiresAt
+		account.ProfileArn = latest.ProfileArn
+		account.ProxyURL = latest.ProxyURL
+	}
+
+	models, err := ListAvailableModels(account)
+	if err != nil {
+		if !useRuntimeModelFallback() {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
+		models = fallbackRuntimeModelInfos()
+	} else if useRuntimeModelFallback() {
+		models = mergeUniqueModels(models, fallbackRuntimeModelInfos())
 	}
+	h.pool.SetModelList(id, modelIDsFromModelInfos(models))
+	h.modelsCacheMu.Lock()
+	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
+	h.modelsCacheTime = time.Now().Unix()
+	h.modelsCacheMu.Unlock()
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"models":  models,
 	})
+}
+
+func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request, id string) {
+	accounts := config.GetAccounts()
+	var account *config.Account
+	for i := range accounts {
+		if accounts[i].ID == id {
+			account = &accounts[i]
+			break
+		}
+	}
+	if account == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+	if latest := h.pool.GetByID(id); latest != nil {
+		account.AccessToken = latest.AccessToken
+		account.RefreshToken = latest.RefreshToken
+		account.ExpiresAt = latest.ExpiresAt
+		account.ProfileArn = latest.ProfileArn
+		account.ProxyURL = latest.ProxyURL
+	}
+	if err := h.fetchAndCacheAccountModels(account); err != nil {
+		if !useRuntimeModelFallback() {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		models := fallbackRuntimeModelInfos()
+		h.pool.SetModelList(id, modelIDsFromModelInfos(models))
+		h.modelsCacheMu.Lock()
+		h.cachedModels = mergeUniqueModels(h.cachedModels, models)
+		h.modelsCacheTime = time.Now().Unix()
+		h.modelsCacheMu.Unlock()
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"count":   len(h.pool.GetModelList(id)),
+	})
+}
+
+func (h *Handler) apiRefreshAllAccountsModels(w http.ResponseWriter, r *http.Request) {
+	h.refreshModelsCache()
+	h.modelsCacheMu.RLock()
+	cachedLen := len(h.cachedModels)
+	h.modelsCacheMu.RUnlock()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"refreshed": cachedLen,
+	})
+}
+
+func (h *Handler) apiGetAccountModelsCached(w http.ResponseWriter, r *http.Request, id string) {
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"models":  h.pool.GetModelList(id),
+	})
+}
+
+func (h *Handler) apiGetAccountOverage(w http.ResponseWriter, r *http.Request, id string) {
+	account := h.findConfigAccount(id)
+	if account == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+	if latest := h.pool.GetByID(id); latest != nil {
+		account.AccessToken = latest.AccessToken
+		account.RefreshToken = latest.RefreshToken
+		account.ExpiresAt = latest.ExpiresAt
+		account.ProfileArn = latest.ProfileArn
+		account.ProxyURL = latest.ProxyURL
+	}
+	snap, err := FetchOverageStatus(account)
+	if err != nil {
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if persistErr := PersistOverageSnapshot(id, snap); persistErr != nil {
+		logger.Warnf("[Overage] persist GET overage failed for %s: %v", account.Email, persistErr)
+	}
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":           true,
+		"overageStatus":     snap.Status,
+		"overageCapability": snap.Capability,
+		"subscriptionTitle": snap.SubscriptionTitle,
+		"overageCap":        snap.OverageCap,
+		"overageRate":       snap.OverageRate,
+		"currentOverages":   snap.CurrentOverages,
+		"overageCheckedAt":  snap.CheckedAt,
+	})
+}
+
+func (h *Handler) apiSetAccountOverage(w http.ResponseWriter, r *http.Request, id string) {
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	account := h.findConfigAccount(id)
+	if account == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+	if latest := h.pool.GetByID(id); latest != nil {
+		account.AccessToken = latest.AccessToken
+		account.RefreshToken = latest.RefreshToken
+		account.ExpiresAt = latest.ExpiresAt
+		account.ProfileArn = latest.ProfileArn
+		account.ProxyURL = latest.ProxyURL
+	}
+	snap, err := SetOverageStatus(account, body.Enabled)
+	if err != nil {
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if persistErr := PersistOverageSnapshot(id, snap); persistErr != nil {
+		logger.Warnf("[Overage] persist SET overage failed for %s: %v", account.Email, persistErr)
+	}
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":           true,
+		"overageStatus":     snap.Status,
+		"overageCapability": snap.Capability,
+		"subscriptionTitle": snap.SubscriptionTitle,
+		"overageCap":        snap.OverageCap,
+		"overageRate":       snap.OverageRate,
+		"currentOverages":   snap.CurrentOverages,
+		"overageCheckedAt":  snap.CheckedAt,
+	})
+}
+
+func (h *Handler) findConfigAccount(id string) *config.Account {
+	accounts := config.GetAccounts()
+	for i := range accounts {
+		if accounts[i].ID == id {
+			return &accounts[i]
+		}
+	}
+	return nil
 }
 
 func (h *Handler) serveAdminPage(w http.ResponseWriter, r *http.Request) {

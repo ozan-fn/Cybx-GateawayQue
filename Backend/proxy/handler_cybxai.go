@@ -110,6 +110,7 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 func accountToConnection(a config.Account) map[string]interface{} {
 	now := time.Now().Unix()
 	status := "active"
+	exhausted := accountQuotaBlockedForView(a)
 	switch {
 	case a.BanStatus == "BANNED":
 		status = "suspended"
@@ -118,12 +119,12 @@ func accountToConnection(a config.Account) map[string]interface{} {
 	case a.ExpiresAt > 0 && now > a.ExpiresAt:
 		status = "expired"
 	case !a.Enabled:
-		if a.UsageLimit > 0 && a.UsageCurrent >= a.UsageLimit && !a.AllowOverage {
+		if exhausted {
 			status = "exhausted"
 		} else {
 			status = "disabled"
 		}
-	case a.UsageLimit > 0 && a.UsageCurrent >= a.UsageLimit && !a.AllowOverage:
+	case exhausted:
 		status = "exhausted"
 	}
 
@@ -169,6 +170,7 @@ func accountToConnection(a config.Account) map[string]interface{} {
 		"loginProvider":     a.Provider,
 		"authMethod":        a.AuthMethod,
 		"region":            a.Region,
+		"proxyURL":          a.ProxyURL,
 		"subscriptionType":  a.SubscriptionType,
 		"subscriptionTitle": a.SubscriptionTitle,
 		"subscription":      subscription,
@@ -191,6 +193,12 @@ func accountToConnection(a config.Account) map[string]interface{} {
 		"weight":            a.Weight,
 		"allowOverage":      a.AllowOverage,
 		"overageWeight":     a.OverageWeight,
+		"overageStatus":     a.OverageStatus,
+		"overageCapability": a.OverageCapability,
+		"overageCap":        a.OverageCap,
+		"overageRate":       a.OverageRate,
+		"currentOverages":   a.CurrentOverages,
+		"overageCheckedAt":  a.OverageCheckedAt,
 		"banStatus":         a.BanStatus,
 		"banReason":         a.BanReason,
 		"banTime":           a.BanTime,
@@ -199,6 +207,14 @@ func accountToConnection(a config.Account) map[string]interface{} {
 		"profileArn":        a.ProfileArn,
 		"uid":               a.ProfileArn,
 	}
+}
+
+func accountQuotaBlockedForView(a config.Account) bool {
+	return a.UsageLimit > 0 &&
+		a.UsageCurrent >= a.UsageLimit &&
+		!a.AllowOverage &&
+		!strings.EqualFold(a.OverageStatus, "ENABLED") &&
+		!config.GetAllowOverUsage()
 }
 
 func maxFloat(a, b float64) float64 {
@@ -568,7 +584,7 @@ func (h *Handler) handleCybxAICreditSummary(w http.ResponseWriter, r *http.Reque
 
 		expired := a.ExpiresAt > 0 && now > a.ExpiresAt
 		banned := a.BanStatus == "BANNED" || a.BanStatus == "SUSPENDED"
-		exhausted := a.UsageLimit > 0 && a.UsageCurrent >= a.UsageLimit && !a.AllowOverage
+		exhausted := accountQuotaBlockedForView(a)
 
 		if banned {
 			totalBanned++
@@ -752,7 +768,7 @@ func (h *Handler) handleCybxAIRemoveExhausted(w http.ResponseWriter, r *http.Req
 	removedCount := 0
 	keep := make([]config.Account, 0, len(accounts))
 	for _, a := range accounts {
-		if a.UsageLimit > 0 && a.UsageCurrent >= a.UsageLimit && !a.AllowOverage {
+		if accountQuotaBlockedForView(a) {
 			removedCount++
 			continue
 		}
@@ -881,7 +897,7 @@ func (h *Handler) handleCybxAIDashboardStats(w http.ResponseWriter, r *http.Requ
 
 		expired := a.ExpiresAt > 0 && now > a.ExpiresAt
 		banned := a.BanStatus == "BANNED" || a.BanStatus == "SUSPENDED"
-		exhausted := a.UsageLimit > 0 && a.UsageCurrent >= a.UsageLimit && !a.AllowOverage
+		exhausted := accountQuotaBlockedForView(a)
 
 		switch {
 		case banned:
@@ -1236,10 +1252,6 @@ func modelContextWindow(id string) int {
 	switch lower {
 	case "auto", "auto-thinking":
 		return 1000000
-	case "claude-opus-4.7", "claude-opus-4.6", "claude-sonnet-4.6":
-		return 1000000
-	case "claude-opus-4.5", "claude-sonnet-4.5", "claude-sonnet-4", "claude-haiku-4.5":
-		return 200000
 	case "deepseek-3.2":
 		return 164000
 	case "minimax-m2.5", "minimax-m2.1":
@@ -1250,6 +1262,9 @@ func modelContextWindow(id string) int {
 		return 256000
 	}
 
+	if strings.HasPrefix(lower, "claude-") {
+		return getContextWindowSize(lower)
+	}
 	if strings.Contains(lower, "opus") || strings.Contains(lower, "sonnet") || strings.Contains(lower, "haiku") {
 		return 200000
 	}

@@ -277,3 +277,30 @@ func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 		t.Fatalf("expected tool result text in continuation content, got %q", content)
 	}
 }
+
+func TestParseModelAndThinkingNormalizesFutureClaudeVersions(t *testing.T) {
+	tests := []struct {
+		input        string
+		wantModel    string
+		wantThinking bool
+	}{
+		{"claude-opus-4-8", "claude-opus-4.8", false},
+		{"claude-opus-4.8", "claude-opus-4.8", false},
+		{"claude-opus-4-8-thinking", "claude-opus-4.8", true},
+		{"claude-sonnet-5-0", "claude-sonnet-5.0", false},
+		{"claude-sonnet-4-20250514", "claude-sonnet-4", false},
+		{"kr/claude-haiku-4.5", "claude-haiku-4.5", false},
+		{"cybxai/kr/claude-opus-4-8", "claude-opus-4.8", false},
+		{"kr/claude-opus-4-8-thinking", "claude-opus-4.8", true},
+	}
+
+	for _, tc := range tests {
+		gotModel, gotThinking := ParseModelAndThinking(tc.input, "-thinking")
+		if gotModel != tc.wantModel {
+			t.Fatalf("%s: expected model %q, got %q", tc.input, tc.wantModel, gotModel)
+		}
+		if gotThinking != tc.wantThinking {
+			t.Fatalf("%s: expected thinking=%v, got %v", tc.input, tc.wantThinking, gotThinking)
+		}
+	}
+}

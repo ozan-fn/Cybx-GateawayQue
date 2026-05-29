@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -210,6 +211,7 @@ func isKiroAccountFailoverError(err error) bool {
 	var httpErr *kiroHTTPError
 	if errors.As(err, &httpErr) {
 		return httpErr.StatusCode == http.StatusTooManyRequests ||
+			httpErr.StatusCode == http.StatusPaymentRequired ||
 			httpErr.StatusCode == http.StatusUnauthorized ||
 			httpErr.StatusCode == http.StatusForbidden ||
 			httpErr.StatusCode >= http.StatusInternalServerError
@@ -220,17 +222,58 @@ func isKiroAccountFailoverError(err error) bool {
 	lower := strings.ToLower(err.Error())
 	return strings.Contains(lower, "unauthorized") ||
 		strings.Contains(lower, "forbidden") ||
+		strings.Contains(lower, "overage") ||
 		strings.Contains(lower, "status 401") ||
 		strings.Contains(lower, "status 403") ||
+		strings.Contains(lower, "status 402") ||
 		strings.Contains(lower, "status 5") ||
 		strings.Contains(lower, "http 5")
 }
 
 var kiroHttpStore atomic.Pointer[http.Client]
 var kiroRestHttpStore atomic.Pointer[http.Client]
+var proxyClientCache sync.Map
 
 func init() {
 	InitKiroHttpClient("")
+}
+
+func GetClientForProxy(proxyURL string) *http.Client {
+	if proxyURL == "" {
+		return kiroHttpStore.Load()
+	}
+	if cached, ok := proxyClientCache.Load(proxyURL); ok {
+		return cached.(*http.Client)
+	}
+	client := &http.Client{
+		Timeout:   5 * time.Minute,
+		Transport: buildKiroTransport(proxyURL),
+	}
+	proxyClientCache.Store(proxyURL, client)
+	return client
+}
+
+func GetRestClientForProxy(proxyURL string) *http.Client {
+	if proxyURL == "" {
+		return kiroRestHttpStore.Load()
+	}
+	cacheKey := "rest:" + proxyURL
+	if cached, ok := proxyClientCache.Load(cacheKey); ok {
+		return cached.(*http.Client)
+	}
+	client := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: buildKiroTransport(proxyURL),
+	}
+	proxyClientCache.Store(cacheKey, client)
+	return client
+}
+
+func ResolveAccountProxyURL(account *config.Account) string {
+	if account != nil && strings.TrimSpace(account.ProxyURL) != "" {
+		return strings.TrimSpace(account.ProxyURL)
+	}
+	return config.GetProxyURL()
 }
 
 func buildKiroTransport(proxyURL string) *http.Transport {
@@ -444,7 +487,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			return err
 		}
 		var httpErr *kiroHTTPError
-		if errors.As(err, &httpErr) && (httpErr.StatusCode == 401 || httpErr.StatusCode == 403) {
+		if errors.As(err, &httpErr) && (httpErr.StatusCode == 401 || httpErr.StatusCode == 402 || httpErr.StatusCode == 403) {
 			return err
 		}
 	}
@@ -475,7 +518,7 @@ func callKiroEndpoint(account *config.Account, payload *KiroPayload, callback *K
 		}
 		applyKiroRequestHeaders(req, account, ep, host, attempt, maxAttempts)
 
-		resp, err := kiroHttpStore.Load().Do(req)
+		resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 		if err != nil {
 			lastErr = err
 			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
@@ -711,11 +754,52 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 
 func getContextWindowSize(model string) int {
 	m := strings.ToLower(model)
-	if strings.Contains(m, "4.6") || strings.Contains(m, "4-6") ||
-		strings.Contains(m, "4.7") || strings.Contains(m, "4-7") {
+	if claudeMillionContext(m) {
 		return 1_000_000
 	}
 	return 200_000
+}
+
+func claudeMillionContext(model string) bool {
+	m := strings.TrimPrefix(strings.TrimSuffix(strings.ToLower(model), "-thinking"), "kr/")
+	parts := strings.Split(m, "-")
+	if len(parts) < 3 || parts[0] != "claude" {
+		return false
+	}
+	family := parts[1]
+	if family != "opus" && family != "sonnet" {
+		return false
+	}
+	var major int
+	var minor int
+	var err error
+	if strings.Contains(parts[2], ".") {
+		version := strings.SplitN(parts[2], ".", 2)
+		if len(version) != 2 {
+			return false
+		}
+		major, err = strconv.Atoi(version[0])
+		if err != nil {
+			return false
+		}
+		minor, err = strconv.Atoi(version[1])
+		if err != nil {
+			return false
+		}
+	} else {
+		if len(parts) < 4 {
+			return false
+		}
+		major, err = strconv.Atoi(parts[2])
+		if err != nil {
+			return false
+		}
+		minor, err = strconv.Atoi(parts[3])
+		if err != nil {
+			return false
+		}
+	}
+	return major > 4 || major == 4 && minor >= 6
 }
 
 func collectUsageMaps(v interface{}, out *[]map[string]interface{}) {

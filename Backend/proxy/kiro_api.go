@@ -28,7 +28,7 @@ func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 
 	setKiroHeaders(req, account)
 
-	resp, err := kiroRestHttpStore.Load().Do(req)
+	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +58,7 @@ func GetUserInfo(account *config.Account) (*UserInfoResponse, error) {
 	setKiroHeaders(req, account)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := kiroRestHttpStore.Load().Do(req)
+	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +87,7 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 
 	setKiroHeaders(req, account)
 
-	resp, err := kiroRestHttpStore.Load().Do(req)
+	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +146,7 @@ func listAvailableProfiles(account *config.Account) (string, error) {
 	setKiroHeaders(req, account)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := kiroRestHttpStore.Load().Do(req)
+	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 	if err != nil {
 		return "", err
 	}

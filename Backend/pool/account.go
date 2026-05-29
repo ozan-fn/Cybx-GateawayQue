@@ -2,6 +2,7 @@ package pool
 
 import (
 	"kiro-go/config"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,7 @@ type AccountPool struct {
 	currentIndex  uint64
 	cooldowns     map[string]time.Time
 	errorCounts   map[string]int
+	modelLists    map[string]map[string]bool
 }
 
 var (
@@ -28,6 +30,7 @@ func GetPool() *AccountPool {
 		pool = &AccountPool{
 			cooldowns:   make(map[string]time.Time),
 			errorCounts: make(map[string]int),
+			modelLists:  make(map[string]map[string]bool),
 		}
 		pool.Reload()
 	})
@@ -38,11 +41,12 @@ func (p *AccountPool) Reload() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	enabled := config.GetEnabledAccounts()
+	allowOverUsage := config.GetAllowOverUsage()
 	var weighted []config.Account
 	for _, a := range enabled {
 		w := effectiveWeight(a.Weight) * overageFrequencyScale
 		if isOverUsageLimit(a) {
-			if !a.AllowOverage {
+			if isQuotaBlocked(a, allowOverUsage) {
 				continue
 			}
 			w = effectiveOverageWeight(a.OverageWeight)
@@ -56,58 +60,71 @@ func (p *AccountPool) Reload() {
 }
 
 func (p *AccountPool) GetNext() *config.Account {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if len(p.accounts) == 0 {
-		return nil
-	}
-
-	now := time.Now()
-	n := len(p.accounts)
-	seen := make(map[string]bool)
-
-	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
-		acc := &p.accounts[idx]
-
-		if seen[acc.ID] {
-			continue
-		}
-
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
-			continue
-		}
-
-		if isOverUsageLimit(*acc) && !acc.AllowOverage {
-			seen[acc.ID] = true
-			continue
-		}
-
-		return acc
-	}
-
-	var best *config.Account
-	var earliest time.Time
-	for i := range p.accounts {
-		acc := &p.accounts[i]
-		if isOverUsageLimit(*acc) && !acc.AllowOverage {
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
-			}
-		} else {
-			return acc
-		}
-	}
-	return best
+	return p.GetNextForModelExcluding("", nil)
 }
 
 func (p *AccountPool) GetNextReadyExcluding(excluded map[string]bool) *config.Account {
+	return p.GetNextForModelExcluding("", excluded)
+}
+
+func (p *AccountPool) SetModelList(accountID string, modelIDs []string) {
+	set := make(map[string]bool, len(modelIDs))
+	for _, id := range modelIDs {
+		normalized := normalizeModelForLookup(id)
+		if normalized != "" {
+			set[normalized] = true
+		}
+	}
+	p.mu.Lock()
+	if p.modelLists == nil {
+		p.modelLists = make(map[string]map[string]bool)
+	}
+	p.modelLists[accountID] = set
+	p.mu.Unlock()
+}
+
+func (p *AccountPool) GetModelList(accountID string) []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	set, ok := p.modelLists[accountID]
+	if !ok || len(set) == 0 {
+		return []string{}
+	}
+	ids := make([]string, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func (p *AccountPool) accountHasModel(accountID, model string) bool {
+	model = normalizeModelForLookup(model)
+	if model == "" || model == "auto" {
+		return true
+	}
+	list, ok := p.modelLists[accountID]
+	if !ok || len(list) == 0 {
+		return true
+	}
+	return list[model]
+}
+
+func normalizeModelForLookup(model string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if strings.HasPrefix(model, "cybxai/") {
+		model = strings.TrimPrefix(model, "cybxai/")
+	}
+	if strings.HasPrefix(model, "kr/") {
+		model = strings.TrimPrefix(model, "kr/")
+	}
+	return model
+}
+
+func (p *AccountPool) GetNextForModel(model string) *config.Account {
+	return p.GetNextForModelExcluding(model, nil)
+}
+
+func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -115,6 +132,7 @@ func (p *AccountPool) GetNextReadyExcluding(excluded map[string]bool) *config.Ac
 		return nil
 	}
 
+	allowOverUsage := config.GetAllowOverUsage()
 	now := time.Now()
 	n := len(p.accounts)
 	seen := make(map[string]bool)
@@ -127,12 +145,17 @@ func (p *AccountPool) GetNextReadyExcluding(excluded map[string]bool) *config.Ac
 			continue
 		}
 
+		if !p.accountHasModel(acc.ID, model) {
+			seen[acc.ID] = true
+			continue
+		}
+
 		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
 			seen[acc.ID] = true
 			continue
 		}
 
-		if isOverUsageLimit(*acc) && !acc.AllowOverage {
+		if isQuotaBlocked(*acc, allowOverUsage) {
 			seen[acc.ID] = true
 			continue
 		}
@@ -147,7 +170,10 @@ func (p *AccountPool) GetNextReadyExcluding(excluded map[string]bool) *config.Ac
 		if excluded != nil && excluded[acc.ID] {
 			continue
 		}
-		if isOverUsageLimit(*acc) && !acc.AllowOverage {
+		if !p.accountHasModel(acc.ID, model) {
+			continue
+		}
+		if isQuotaBlocked(*acc, allowOverUsage) {
 			continue
 		}
 		if cooldown, ok := p.cooldowns[acc.ID]; ok {
@@ -299,6 +325,14 @@ func (p *AccountPool) GetAllAccounts() []config.Account {
 
 func isOverUsageLimit(acc config.Account) bool {
 	return acc.UsageLimit > 0 && acc.UsageCurrent >= acc.UsageLimit
+}
+
+func isQuotaBlocked(acc config.Account, allowOverUsage bool) bool {
+	return isOverUsageLimit(acc) && !allowOverUsage && !acc.AllowOverage && !isUpstreamOverageEnabled(acc)
+}
+
+func isUpstreamOverageEnabled(acc config.Account) bool {
+	return strings.EqualFold(acc.OverageStatus, "ENABLED")
 }
 
 func effectiveWeight(weight int) int {
