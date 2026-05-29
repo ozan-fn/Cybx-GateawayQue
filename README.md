@@ -631,6 +631,22 @@ Keterangan folder:
 
 ---
 
+## Kontribusi
+
+Project ini terbuka untuk kontribusi melalui pull request. Jika ingin membantu pengembangan backend, dashboard, dokumentasi, testing, atau integrasi tool, silakan cek halaman Issues dan ikuti panduan di [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Area kontribusi yang dibutuhkan:
+
+- Backend Kiro engine, routing, failover, dan API compatibility.
+- Dashboard admin, UX, chart, logs, dan halaman konfigurasi.
+- Test coverage untuk backend dan fitur proxy.
+- Dokumentasi setup, API usage, dan deployment.
+- Integrasi tool AI coding.
+
+Untuk kontribusi kecil, cari issue dengan label `good first issue` atau `help wanted`. Untuk perubahan besar, buka issue terlebih dahulu agar scope dapat dibahas sebelum implementasi.
+
+---
+
 ## Kontak & Support
 
 Jika ada keperluan, kerja sama, pertanyaan, atau support request, silakan hubungi saya melalui Discord atau Telegram.
