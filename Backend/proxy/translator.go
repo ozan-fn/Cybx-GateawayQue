@@ -258,6 +258,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	if len(history) > 0 {
 		payload.ConversationState.History = history
 	}
+	attachToolsToToolResultHistory(payload, kiroTools)
 
 	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
 		payload.InferenceConfig = &InferenceConfig{
@@ -883,6 +884,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	if len(history) > 0 {
 		payload.ConversationState.History = history
 	}
+	attachToolsToToolResultHistory(payload, kiroTools)
 
 	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
 		payload.InferenceConfig = &InferenceConfig{
@@ -1007,6 +1009,22 @@ func buildToolResultsContinuation(toolResults []KiroToolResult) string {
 		return joined[:4000]
 	}
 	return joined
+}
+
+func attachToolsToToolResultHistory(payload *KiroPayload, tools []KiroToolWrapper) {
+	if payload == nil || len(tools) == 0 {
+		return
+	}
+	for i := range payload.ConversationState.History {
+		msg := payload.ConversationState.History[i].UserInputMessage
+		if msg == nil || msg.UserInputMessageContext == nil {
+			continue
+		}
+		if len(msg.UserInputMessageContext.ToolResults) == 0 || len(msg.UserInputMessageContext.Tools) > 0 {
+			continue
+		}
+		msg.UserInputMessageContext.Tools = tools
+	}
 }
 
 func trimLeadingAssistantHistory(history []KiroHistoryMessage) []KiroHistoryMessage {

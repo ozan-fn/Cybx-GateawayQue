@@ -2493,6 +2493,10 @@ func recordUsageWithCtx(account *config.Account, model string, inputTokens, outp
 
 func flushAccountUsage(accountID string) {
 	uc := getAccountUsageCtx(accountID)
+	flushUsageCtx(uc)
+}
+
+func flushUsageCtx(uc *usageCtx) {
 	if uc == nil || uc.Pending == nil {
 		return
 	}
@@ -2819,6 +2823,33 @@ func setAccountUsageCtx(accountID string, c *usageCtx) {
 		return
 	}
 	usageCtxByAccount[accountID] = c
+}
+
+func rebindAccountUsageCtx(oldAccountID, newAccountID string) {
+	if oldAccountID == "" || newAccountID == "" || oldAccountID == newAccountID {
+		return
+	}
+	usageCtxByAccountMu.Lock()
+	defer usageCtxByAccountMu.Unlock()
+	c := usageCtxByAccount[oldAccountID]
+	if c == nil {
+		return
+	}
+	delete(usageCtxByAccount, oldAccountID)
+	usageCtxByAccount[newAccountID] = c
+}
+
+func clearUsageCtx(c *usageCtx) {
+	if c == nil {
+		return
+	}
+	usageCtxByAccountMu.Lock()
+	defer usageCtxByAccountMu.Unlock()
+	for accountID, existing := range usageCtxByAccount {
+		if existing == c {
+			delete(usageCtxByAccount, accountID)
+		}
+	}
 }
 
 func getAccountUsageCtx(accountID string) *usageCtx {

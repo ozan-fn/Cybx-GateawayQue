@@ -760,11 +760,9 @@ export default function LogsPage() {
 
           {/* Clear All button */}
           <Dialog>
-            <DialogTrigger>
-              <Button variant="destructive" size="sm" disabled={clearing}>
-                <Trash2 className="mr-1.5 h-3.5 w-3.5" />
-                Clear All
-              </Button>
+            <DialogTrigger render={<Button variant="destructive" size="sm" disabled={clearing} />}>
+              <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+              Clear All
             </DialogTrigger>
             <DialogContent>
               <DialogHeader>
@@ -774,14 +772,10 @@ export default function LogsPage() {
                 </DialogDescription>
               </DialogHeader>
               <div className="flex justify-end gap-2 mt-4">
-                <DialogClose>
-                  <Button variant="outline">Cancel</Button>
-                </DialogClose>
-                <DialogClose>
-                  <Button variant="destructive" onClick={handleClearAll} disabled={clearing}>
-                    {clearing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Trash2 className="mr-2 h-4 w-4" />}
-                    Delete All Logs
-                  </Button>
+                <DialogClose render={<Button variant="outline" />}>Cancel</DialogClose>
+                <DialogClose render={<Button variant="destructive" onClick={handleClearAll} disabled={clearing} />}>
+                  {clearing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Trash2 className="mr-2 h-4 w-4" />}
+                  Delete All Logs
                 </DialogClose>
               </div>
             </DialogContent>

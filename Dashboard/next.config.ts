@@ -9,6 +9,7 @@ if (process.env.NEXT_STATIC_EXPORT === "true") {
 
 const nextConfig: NextConfig = {
   ...(outputMode ? { output: outputMode } : {}),
+  devIndicators: false,
   images: { unoptimized: true },
 };
 

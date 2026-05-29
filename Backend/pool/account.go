@@ -10,12 +10,12 @@ import (
 const overageFrequencyScale = 10
 
 type AccountPool struct {
-	mu           sync.RWMutex
-	accounts     []config.Account
+	mu            sync.RWMutex
+	accounts      []config.Account
 	totalAccounts int
-	currentIndex uint64
-	cooldowns    map[string]time.Time
-	errorCounts  map[string]int
+	currentIndex  uint64
+	cooldowns     map[string]time.Time
+	errorCounts   map[string]int
 }
 
 var (
@@ -80,11 +80,6 @@ func (p *AccountPool) GetNext() *config.Account {
 			continue
 		}
 
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-300 {
-			seen[acc.ID] = true
-			continue
-		}
-
 		if isOverUsageLimit(*acc) && !acc.AllowOverage {
 			seen[acc.ID] = true
 			continue
@@ -137,11 +132,6 @@ func (p *AccountPool) GetNextReadyExcluding(excluded map[string]bool) *config.Ac
 			continue
 		}
 
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-300 {
-			seen[acc.ID] = true
-			continue
-		}
-
 		if isOverUsageLimit(*acc) && !acc.AllowOverage {
 			seen[acc.ID] = true
 			continue
@@ -150,7 +140,26 @@ func (p *AccountPool) GetNextReadyExcluding(excluded map[string]bool) *config.Ac
 		return acc
 	}
 
-	return nil
+	var best *config.Account
+	var earliest time.Time
+	for i := range p.accounts {
+		acc := &p.accounts[i]
+		if excluded != nil && excluded[acc.ID] {
+			continue
+		}
+		if isOverUsageLimit(*acc) && !acc.AllowOverage {
+			continue
+		}
+		if cooldown, ok := p.cooldowns[acc.ID]; ok {
+			if best == nil || cooldown.Before(earliest) {
+				best = acc
+				earliest = cooldown
+			}
+		} else {
+			return acc
+		}
+	}
+	return best
 }
 
 func (p *AccountPool) GetByID(id string) *config.Account {

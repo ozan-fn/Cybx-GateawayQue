@@ -18,7 +18,7 @@ import (
 )
 
 type Handler struct {
-	pool *pool.AccountPool
+	pool            *pool.AccountPool
 	totalRequests   int64
 	successRequests int64
 	failedRequests  int64
@@ -467,6 +467,41 @@ func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
 	}
 }
 
+func fallbackRuntimeModelInfos() []ModelInfo {
+	ids := []string{
+		"auto",
+		"claude-sonnet-4",
+		"claude-sonnet-4.5",
+		"claude-sonnet-4.6",
+		"claude-haiku-4.5",
+		"claude-opus-4.5",
+		"claude-opus-4.6",
+		"claude-opus-4.7",
+		"deepseek-3.2",
+		"glm-5",
+		"minimax-m2.1",
+		"minimax-m2.5",
+		"qwen3-coder-next",
+	}
+	models := make([]ModelInfo, 0, len(ids))
+	for _, id := range ids {
+		inputTypes := []string{"text"}
+		if strings.HasPrefix(id, "claude-") {
+			inputTypes = append(inputTypes, "image")
+		}
+		models = append(models, ModelInfo{
+			ModelId:    id,
+			InputTypes: inputTypes,
+		})
+	}
+	return models
+}
+
+func useRuntimeModelFallback() bool {
+	endpoint := config.GetPreferredEndpoint()
+	return endpoint == "runtime" || endpoint == "auto"
+}
+
 func modelSupportsImage(inputTypes []string) bool {
 	for _, t := range inputTypes {
 		lt := strings.ToLower(t)
@@ -513,6 +548,16 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 func (h *Handler) refreshModelsCache() {
 	accounts := config.GetEnabledAccounts()
 	if len(accounts) == 0 {
+		return
+	}
+
+	if useRuntimeModelFallback() {
+		models := fallbackRuntimeModelInfos()
+		h.modelsCacheMu.Lock()
+		h.cachedModels = models
+		h.modelsCacheTime = time.Now().Unix()
+		h.modelsCacheMu.Unlock()
+		logger.Infof("[ModelsCache] Cached %d runtime fallback models", len(models))
 		return
 	}
 
@@ -679,11 +724,6 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if err := h.ensureValidToken(account); err != nil {
-		h.sendClaudeError(w, 503, "api_error", "Token refresh failed: "+err.Error())
-		return
-	}
-
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
@@ -695,10 +735,14 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
-	_usageTee := newResponseTee(w, 64*1024); w = _usageTee
-	setAccountUsageCtx(account.ID, &usageCtx{Endpoint: r.URL.Path, StartTime: time.Now(), RequestBody: string(body), Streaming: req.Stream, ResponseTee: _usageTee})
-	defer setAccountUsageCtx(account.ID, nil)
-	defer flushAccountUsage(account.ID)
+	_usageTee := newResponseTee(w, 64*1024)
+	w = _usageTee
+	_usageCtx := &usageCtx{Endpoint: r.URL.Path, StartTime: time.Now(), RequestBody: string(body), Streaming: req.Stream, ResponseTee: _usageTee}
+	setAccountUsageCtx(account.ID, _usageCtx)
+	defer func() {
+		flushUsageCtx(_usageCtx)
+		clearUsageCtx(_usageCtx)
+	}()
 	if req.Stream {
 		h.handleClaudeStream(w, account, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheUsage, cacheProfile)
 	} else {
@@ -1052,6 +1096,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		},
 	}
 
+	initialAccountID := account.ID
 	usedAccount, err := h.callKiroAPIWithAccountFailover(account, payload, callback)
 	if err != nil {
 		h.recordFailure()
@@ -1061,6 +1106,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		})
 		return
 	}
+	rebindAccountUsageCtx(initialAccountID, usedAccount.ID)
 	account = usedAccount
 
 	processClaudeText("", false, true)
@@ -1322,12 +1368,14 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 		},
 	}
 
+	initialAccountID := account.ID
 	usedAccount, err := h.callKiroAPIWithAccountFailover(account, payload, callback)
 	if err != nil {
 		h.recordFailure()
 		h.sendClaudeError(w, kiroErrorStatus(err, 500), kiroClaudeErrorType(err), err.Error())
 		return
 	}
+	rebindAccountUsageCtx(initialAccountID, usedAccount.ID)
 	account = usedAccount
 
 	thinkingFormat := thinkingOpts.Format
@@ -1425,11 +1473,6 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.ensureValidToken(account); err != nil {
-		h.sendOpenAIError(w, 503, "server_error", "Token refresh failed")
-		return
-	}
-
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
@@ -1437,10 +1480,14 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
-	_usageTee := newResponseTee(w, 64*1024); w = _usageTee
-	setAccountUsageCtx(account.ID, &usageCtx{Endpoint: r.URL.Path, StartTime: time.Now(), RequestBody: string(body), Streaming: req.Stream, ResponseTee: _usageTee})
-	defer setAccountUsageCtx(account.ID, nil)
-	defer flushAccountUsage(account.ID)
+	_usageTee := newResponseTee(w, 64*1024)
+	w = _usageTee
+	_usageCtx := &usageCtx{Endpoint: r.URL.Path, StartTime: time.Now(), RequestBody: string(body), Streaming: req.Stream, ResponseTee: _usageTee}
+	setAccountUsageCtx(account.ID, _usageCtx)
+	defer func() {
+		flushUsageCtx(_usageCtx)
+		clearUsageCtx(_usageCtx)
+	}()
 	if req.Stream {
 		h.handleOpenAIStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
 	} else {
@@ -1745,12 +1792,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		},
 	}
 
+	initialAccountID := account.ID
 	usedAccount, err := h.callKiroAPIWithAccountFailover(account, payload, callback)
 	if err != nil {
 		h.recordFailure()
 		h.sendOpenAIStreamError(w, flusher, kiroOpenAIErrorType(err), err.Error())
 		return
 	}
+	rebindAccountUsageCtx(initialAccountID, usedAccount.ID)
 	account = usedAccount
 
 	processText("", false, true)
@@ -1835,12 +1884,14 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 		},
 	}
 
+	initialAccountID := account.ID
 	usedAccount, err := h.callKiroAPIWithAccountFailover(account, payload, callback)
 	if err != nil {
 		h.recordFailure()
 		h.sendOpenAIError(w, kiroErrorStatus(err, 500), kiroOpenAIErrorType(err), err.Error())
 		return
 	}
+	rebindAccountUsageCtx(initialAccountID, usedAccount.ID)
 	account = usedAccount
 
 	finalContent, extractedReasoning := extractThinkingFromContent(content)
@@ -2833,11 +2884,15 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
-	models, err := ListAvailableModels(account)
-	if err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
+	models := fallbackRuntimeModelInfos()
+	if !useRuntimeModelFallback() {
+		var err error
+		models, err = ListAvailableModels(account)
+		if err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -2915,10 +2970,10 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	valid := map[string]bool{"auto": true, "kiro": true, "codewhisperer": true, "amazonq": true}
+	valid := map[string]bool{"auto": true, "runtime": true, "kiro": true, "codewhisperer": true, "amazonq": true}
 	if !valid[req.PreferredEndpoint] {
 		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid endpoint, must be: auto, kiro, codewhisperer, or amazonq"})
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid endpoint, must be: auto, runtime, kiro, codewhisperer, or amazonq"})
 		return
 	}
 

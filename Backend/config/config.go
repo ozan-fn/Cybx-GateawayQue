@@ -141,11 +141,12 @@ func Load() error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			cfg = &Config{
-				Password:      "changeme",
-				Port:          8085,
-				Host:          "0.0.0.0",
-				RequireApiKey: false,
-				Accounts:      []Account{},
+				Password:          "changeme",
+				Port:              8085,
+				Host:              "0.0.0.0",
+				RequireApiKey:     false,
+				PreferredEndpoint: "runtime",
+				Accounts:          []Account{},
 			}
 			return Save()
 		}
@@ -412,7 +413,7 @@ func GetPreferredEndpoint() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 	if cfg.PreferredEndpoint == "" {
-		return "auto"
+		return "runtime"
 	}
 	return cfg.PreferredEndpoint
 }

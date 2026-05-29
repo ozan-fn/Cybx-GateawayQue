@@ -1,8 +1,14 @@
 package proxy
 
 import (
+	"fmt"
+	"kiro-go/config"
+	"kiro-go/pool"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -80,6 +86,146 @@ func TestInitKiroHttpClientKeepsShortRestTimeout(t *testing.T) {
 	if restClient.Timeout != 30*time.Second {
 		t.Fatalf("expected REST timeout to stay 30s, got %s", restClient.Timeout)
 	}
+}
+
+func TestResolveKiroRuntimeEndpointUsesAccountRegion(t *testing.T) {
+	ep := kiroEndpoint{URL: "https://runtime.{region}.kiro.dev/generateAssistantResponse"}
+	account := &config.Account{Region: "eu-central-1"}
+
+	got := resolveKiroEndpointURL(ep, account)
+	want := "https://runtime.eu-central-1.kiro.dev/generateAssistantResponse"
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestApplyKiroRequestHeadersUsesRuntimeGatewayHeaders(t *testing.T) {
+	req := httptest.NewRequest("POST", "https://runtime.us-east-1.kiro.dev/generateAssistantResponse", nil)
+	account := &config.Account{AccessToken: "token", MachineId: "machine-123"}
+	ep := kiroEndpoint{
+		AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+		Runtime:   true,
+	}
+
+	applyKiroRequestHeaders(req, account, ep, "runtime.us-east-1.kiro.dev", 1, 3)
+
+	if got := req.Header.Get("Content-Type"); got != "application/x-amz-json-1.0" {
+		t.Fatalf("expected runtime content type, got %q", got)
+	}
+	if got := req.Header.Get("X-Amz-Target"); got != "AmazonCodeWhispererStreamingService.GenerateAssistantResponse" {
+		t.Fatalf("expected x-amz-target, got %q", got)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer token" {
+		t.Fatalf("expected authorization header, got %q", got)
+	}
+}
+
+func TestCallKiroEndpointDoesNotFanoutOrRetrySuspicious429(t *testing.T) {
+	count := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count++
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"message":"Due to suspicious activity, we are imposing temporary limits on how frequently your account can send a request to Kiro while we investigate.","reason":null}`))
+	}))
+	defer server.Close()
+
+	err := callKiroEndpoint(&config.Account{AccessToken: "token"}, minimalKiroPayload(), &KiroStreamCallback{}, kiroEndpoint{
+		URL:       server.URL,
+		Origin:    "AI_EDITOR",
+		AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+		Name:      "Kiro Runtime",
+		Runtime:   true,
+	})
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if count != 1 {
+		t.Fatalf("expected one upstream call, got %d", count)
+	}
+	if !isKiroTemporaryLimitError(err) {
+		t.Fatalf("expected temporary limit error, got %v", err)
+	}
+}
+
+func TestKiroAccountFailoverAcceptsString429(t *testing.T) {
+	err := fmt.Errorf("HTTP 429 from Kiro Runtime: {\"message\":\"Due to suspicious activity, we are imposing temporary limits\"}")
+
+	if !isKiroAccountFailoverError(err) {
+		t.Fatalf("expected string 429 to trigger account failover")
+	}
+}
+
+func TestCallKiroAPIWithAccountFailoverRetriesAnotherAccount(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config init failed: %v", err)
+	}
+	if err := config.AddAccount(config.Account{ID: "a1", Email: "a1@example.com", AccessToken: "token-a1", ProfileArn: "arn:a1", Enabled: true}); err != nil {
+		t.Fatalf("add account a1 failed: %v", err)
+	}
+	if err := config.AddAccount(config.Account{ID: "a2", Email: "a2@example.com", AccessToken: "token-a2", ProfileArn: "arn:a2", Enabled: true}); err != nil {
+		t.Fatalf("add account a2 failed: %v", err)
+	}
+
+	var mu sync.Mutex
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls = append(calls, r.Header.Get("Authorization"))
+		callCount := len(calls)
+		mu.Unlock()
+
+		if callCount == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"message":"Due to suspicious activity, we are imposing temporary limits"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{{
+		URL:       server.URL,
+		Origin:    "AI_EDITOR",
+		AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+		Name:      "Kiro Runtime",
+		Runtime:   true,
+	}}
+	t.Cleanup(func() { kiroEndpoints = oldEndpoints })
+
+	p := pool.GetPool()
+	p.Reload()
+	handler := &Handler{pool: p}
+	payload := minimalKiroPayload()
+	payload.ProfileArn = "arn:test"
+
+	used, err := handler.callKiroAPIWithAccountFailover(nil, payload, &KiroStreamCallback{
+		OnComplete: func(int, int) {},
+	})
+	if err != nil {
+		t.Fatalf("expected failover success, got %v", err)
+	}
+	if used == nil {
+		t.Fatalf("expected used account")
+	}
+	if len(calls) != 2 {
+		t.Fatalf("expected two upstream calls, got %d", len(calls))
+	}
+	if calls[0] == calls[1] {
+		t.Fatalf("expected failover to use a different account")
+	}
+}
+
+func minimalKiroPayload() *KiroPayload {
+	payload := &KiroPayload{}
+	payload.ConversationState.ChatTriggerType = "MANUAL"
+	payload.ConversationState.ConversationID = "conversation"
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "hello",
+		ModelID: "claude-opus-4.7",
+		Origin:  "AI_EDITOR",
+	}
+	return payload
 }
 
 func mustParseURL(t *testing.T, raw string) *url.URL {
