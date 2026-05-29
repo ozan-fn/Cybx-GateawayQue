@@ -2,7 +2,7 @@
 
 <video src="https://github.com/user-attachments/assets/a084b7aa-2742-4689-a503-e31509b77ac3" controls width="100%"></video>
 
-**Cybx-GateawayQue** adalah gateway proxy self-hosted untuk mengelola akses Kiro melalui dashboard admin berbasis **Next.js 16 + React 19**. Project ini menyediakan kompatibilitas API format OpenAI Chat Completions dan Anthropic Messages, pool multi-akun Kiro, pencatatan penggunaan, manajemen API key, proxy pool, content filter, integrasi tool AI coding, dan dashboard operasional.
+**Cybx-GateawayQue** adalah gateway proxy self-hosted yang dibangun dengan Go sebagai backend utama untuk mengelola akses Kiro melalui dashboard admin berbasis **Next.js 16 + React 19**. Project ini menyediakan kompatibilitas API format OpenAI Chat Completions dan Anthropic Messages, pool multi-akun Kiro, pencatatan penggunaan, manajemen API key, proxy pool, content filter, integrasi tool AI coding, dan dashboard operasional.
 
 ---
 
