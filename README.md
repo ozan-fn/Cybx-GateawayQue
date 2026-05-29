@@ -631,6 +631,17 @@ Keterangan folder:
 
 ---
 
+## Kontak & Support
+
+Jika ada keperluan, kerja sama, pertanyaan, atau support request, silakan hubungi saya melalui Discord atau Telegram.
+
+| Platform | Kontak |
+|----------|--------|
+| <img src="https://cdn.simpleicons.org/discord/5865F2" width="18" alt="Discord" /> Discord | `cybh22` |
+| <img src="https://cdn.simpleicons.org/telegram/26A5E4" width="18" alt="Telegram" /> Telegram | [@Cyb192](https://t.me/Cyb192) |
+
+---
+
 ## Lisensi
 
 Project ini dilisensikan di bawah [MIT License](LICENSE).
