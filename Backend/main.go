@@ -42,11 +42,18 @@ func main() {
 
 	handler := proxy.NewHandler()
 
-	addr := fmt.Sprintf("%s:%d", config.GetHost(), config.GetPort())
+	host := config.GetHost()
+	port := config.GetPort()
+	addr := fmt.Sprintf("%s:%d", host, port)
+	displayHost := host
+	if displayHost == "0.0.0.0" || displayHost == "" {
+		displayHost = "127.0.0.1"
+	}
+	displayAddr := fmt.Sprintf("%s:%d", displayHost, port)
 	logger.Infof("Kiro-Cybxai starting on http://%s (log level: %s)", addr, logger.LevelName(logger.GetLevel()))
-	logger.Infof("Admin panel: http://%s/admin", addr)
-	logger.Infof("Claude API: http://%s/v1/messages", addr)
-	logger.Infof("OpenAI API: http://%s/v1/chat/completions", addr)
+	logger.Infof("Dashboard: http://%s", displayAddr)
+	logger.Infof("Claude API: http://%s/v1/messages", displayAddr)
+	logger.Infof("OpenAI API: http://%s/v1/chat/completions", displayAddr)
 
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		logger.Fatalf("Server failed: %v", err)

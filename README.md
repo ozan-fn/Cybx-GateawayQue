@@ -2,7 +2,7 @@
 
 <video src="https://github.com/user-attachments/assets/a084b7aa-2742-4689-a503-e31509b77ac3" controls width="100%"></video>
 
-**Cybx-GateawayQue** adalah gateway proxy self-hosted yang dibangun dengan Go sebagai backend utama untuk mengelola akses Kiro melalui dashboard admin berbasis **Next.js 16 + React 19**. Project ini menyediakan kompatibilitas API format OpenAI Chat Completions dan Anthropic Messages, pool multi-akun Kiro, pencatatan penggunaan, manajemen API key, proxy pool, content filter, integrasi tool AI coding, dan dashboard operasional.
+**Cybx-GateawayQue** adalah gateway proxy self-hosted yang dibangun dengan Go sebagai backend utama untuk mengelola akses Kiro melalui dashboard admin berbasis **Next.js 16 + React 19**. Project ini menyediakan kompatibilitas API format OpenAI Chat Completions dan Anthropic Messages, pool multi-akun Kiro, pencatatan penggunaan, manajemen API key, proxy pool, content filter, integrasi tool AI coding, dan dashboard operasional. Pada mode production, dashboard dapat diekspor sebagai static asset dan diserve langsung oleh binary backend `kiro-go.exe`.
 
 ---
 
@@ -11,7 +11,7 @@
 Sistem ini berfokus pada 3 komponen utama:
 
 1. **Gateway Backend**: Menyediakan endpoint HTTP untuk OpenAI-compatible API, Anthropic-compatible API, dashboard API, health check, statistik penggunaan, dan routing request ke Kiro upstream.
-2. **Dashboard Admin**: Mengelola akun, provider, model, API key, logs, usage chart, filter, proxy pool, scraper, tunnel, keamanan, dan integrasi tool.
+2. **Dashboard Admin**: Mengelola akun, provider, model, API key, logs, usage chart, filter, proxy pool, scraper, tunnel, keamanan, dan integrasi tool. Pada build production, dashboard diserve dari backend tanpa menjalankan proses Next.js terpisah.
 3. **Client / API Consumer**: Mengakses proxy melalui endpoint `/v1/chat/completions`, `/v1/messages`, atau konfigurasi integrasi tool seperti Claude Code, OpenCode, Cline, Hermes, Pi, Zed, dan Open Claw.
 
 Fitur yang tersedia:
@@ -194,7 +194,7 @@ Isi `Dashboard/.env.local`:
 NEXT_PUBLIC_API_URL=http://127.0.0.1:8085
 ```
 
-**4. Jalankan backend dan dashboard**
+**4. Jalankan backend dan dashboard untuk development**
 
 ```bash
 npm run dev
@@ -258,16 +258,29 @@ http://127.0.0.1:7471
 
 ## Build Production
 
-Build backend dan dashboard dari root project:
+Build production dari root project:
 
 ```bash
 npm run build
 ```
 
-Menjalankan hasil build:
+Perintah tersebut akan:
+
+1. Mengekspor dashboard Next.js menjadi static files.
+2. Menyalin hasil export ke `Backend/dashboard`.
+3. Membuild backend Go menjadi `Backend/kiro-go.exe`.
+
+Menjalankan hasil build di Windows:
+
+```powershell
+.\Backend\kiro-go.exe
+```
+
+Atau dari folder `Backend`:
 
 ```bash
-npm run start
+cd Backend
+./kiro-go.exe
 ```
 
 Output backend lokal:
@@ -276,7 +289,20 @@ Output backend lokal:
 Backend/kiro-go.exe
 ```
 
-Catatan: build dashboard dapat menampilkan peringatan Next.js tentang multiple lockfile karena root project dan folder `Dashboard` sama-sama memiliki `package-lock.json`. Peringatan ini tidak memblokir proses build.
+Dashboard production berjalan langsung dari backend, sehingga tidak perlu menjalankan `next start` atau proses Node.js terpisah. Setelah `kiro-go.exe` berjalan, buka:
+
+```text
+http://127.0.0.1:8085
+```
+
+Jika log server menampilkan `http://0.0.0.0:8085`, gunakan `http://127.0.0.1:8085` saat membuka dari browser lokal. Alamat `0.0.0.0` hanya dipakai untuk bind server.
+
+Catatan:
+
+- `Backend/dashboard` adalah output build static dan tidak perlu di-commit.
+- Route dashboard utama berada di `/`.
+- Route `/admin` akan diarahkan ke `/` untuk kompatibilitas.
+- Build dashboard dapat menampilkan peringatan Next.js tentang multiple lockfile karena root project dan folder `Dashboard` sama-sama memiliki `package-lock.json`. Peringatan ini tidak memblokir proses build.
 
 ---
 
@@ -578,6 +604,7 @@ Cybx-GateawayQue/
 |   |-- context-filtes/
 |   |   |-- filters.json
 |   |-- data/
+|   |-- dashboard/
 |   |-- integration/
 |   |-- logger/
 |   |-- pool/
@@ -602,6 +629,9 @@ Cybx-GateawayQue/
 |-- docker/
 |   |-- entrypoint.sh
 |
+|-- scripts/
+|   |-- build-dashboard-static.mjs
+|
 |-- .dockerignore
 |-- .env.example
 |-- .gitignore
@@ -618,6 +648,7 @@ Keterangan folder:
 - `Backend/contentfilter` berisi compiler dan runtime filter regex.
 - `Backend/context-filtes/filters.json` berisi konfigurasi rule filter yang dimuat saat startup.
 - `Backend/data` berisi file runtime (`config.json`, `usage_records.json`, dll). Folder ini dibuat otomatis saat aplikasi pertama kali berjalan.
+- `Backend/dashboard` berisi output static dashboard hasil `npm run build`. Folder ini dibuat otomatis dan tidak perlu di-commit.
 - `Backend/integration` berisi generator konfigurasi tool AI coding.
 - `Backend/logger` berisi modul logging backend.
 - `Backend/pool` berisi account pool dan pemilihan akun.
@@ -628,6 +659,7 @@ Keterangan folder:
 - `Dashboard/src/lib` berisi helper API dan utilitas frontend.
 - `Dashboard/src/stores` berisi state management Zustand.
 - `docker/entrypoint.sh` berisi entrypoint container yang menjalankan backend dan dashboard secara paralel.
+- `scripts/build-dashboard-static.mjs` berisi script build static dashboard dan penyalinan output ke `Backend/dashboard`.
 
 ---
 

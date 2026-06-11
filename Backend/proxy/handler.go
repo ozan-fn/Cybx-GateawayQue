@@ -33,6 +33,7 @@ type Handler struct {
 	modelsCacheTime int64
 	promptCache     *promptCacheTracker
 	cybxaiMux       *http.ServeMux
+	dashboard       *dashboardServer
 }
 
 type thinkingStreamSource int
@@ -220,6 +221,7 @@ func NewHandler() *Handler {
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 		cybxaiMux:       http.NewServeMux(),
+		dashboard:       newDashboardServer(),
 	}
 	h.RegisterCybxAIRoutes(h.cybxaiMux)
 	go h.backgroundRefresh()
@@ -352,13 +354,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.cybxaiMux.ServeHTTP(w, r)
 
 	case path == "/admin" || path == "/admin/":
-		h.serveAdminPage(w, r)
+		http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
 	case strings.HasPrefix(path, "/admin/api/"):
 		h.handleAdminAPI(w, r)
 	case strings.HasPrefix(path, "/admin/"):
 		h.serveStaticFile(w, r)
 
-	case path == "/health" || path == "/":
+	case path == "/health":
 		h.handleHealth(w, r)
 
 	case path == "/v1/stats":
@@ -371,6 +373,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleStats(w, r)
 
 	default:
+		if h.dashboard != nil && h.dashboard.Serve(w, r) {
+			return
+		}
 		http.Error(w, "Not Found", 404)
 	}
 }

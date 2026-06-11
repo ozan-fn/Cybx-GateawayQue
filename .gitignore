@@ -6,7 +6,9 @@ debugging/
 
 Backend/kiro-go
 Backend/*.exe
+Backend/*.exe~
 Backend/data/
+Backend/dashboard/
 
 .env
 .env.local
