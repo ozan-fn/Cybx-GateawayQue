@@ -197,16 +197,8 @@ export default function SecurityPage() {
               <p className="text-xs text-yellow-600 dark:text-yellow-400">
                 Set a password below to enable authentication.
               </p>
-            )}
-            {status?.isLocal && (
-              <div className="rounded-lg border border-blue-500/20 bg-blue-500/5 p-3">
-                <p className="text-xs text-blue-600 dark:text-blue-400">
-                  <strong>You are accessing from localhost</strong> — auth is
-                  bypassed for local connections regardless of settings.
-                </p>
-              </div>
-            )}
-          </CardContent>
+             )}
+           </CardContent>
         </Card>
       </motion.div>
 

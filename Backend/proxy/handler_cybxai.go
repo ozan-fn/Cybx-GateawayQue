@@ -1409,7 +1409,7 @@ func (h *Handler) handleCybxAIAuthStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	hasPassword := config.GetPassword() != ""
-	authenticated := isAdminAuthenticated(r) || !hasPassword || isLocalRequest(r)
+	authenticated := isAdminAuthenticated(r) || !hasPassword
 	settings := loadCybxAISettings()
 	authEnabled := hasPassword && settings.AuthEnabled
 	if !hasPassword {
